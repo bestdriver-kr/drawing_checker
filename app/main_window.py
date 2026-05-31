@@ -79,6 +79,7 @@ from .project import (
 )
 
 APP_VERSION = "1.0"
+APP_TITLE = f"Drawing Checker v{APP_VERSION}"
 
 # ---------------------------------------------------------------- UI 언어(i18n)
 _UI_LANG = "ko"  # "ko" | "en"
@@ -117,7 +118,7 @@ highlights dimension items that have no marker.</p>
   <li>Tools: pen · highlighter · eraser (whole-stroke / pixel)</li>
   <li>Layers: add·delete·reorder·show/hide·opacity·blend (multiply)</li>
   <li>Mark check (OCR): finds unmarked text (red dashed) / warns on save</li>
-  <li>OCR engines: Drawing OCR · EasyOCR · Tesseract · RapidOCR · Windows OCR</li>
+  <li>OCR engines: RapidOCR (default) · Drawing OCR · Tesseract · Windows OCR</li>
   <li>Compute device: Auto / GPU / CPU</li>
   <li>Save: <b>.dck</b> (re-editable) + <b>.pdf</b> (toggle layers) together</li>
   <li>Export: PNG · TIFF · PDF (OCG layers) · OpenRaster (.ora)</li>
@@ -135,7 +136,7 @@ highlights dimension items that have no marker.</p>
   <li>도구: 펜 · 형광펜 · 지우개(획 전체 / 부분)</li>
   <li>레이어: 추가·삭제·순서·표시숨김·불투명도·블렌드(멀티플라이)</li>
   <li>마킹검사(OCR): 미마킹 텍스트를 빨간 점선으로 표시 / 저장 시 경고</li>
-  <li>OCR 엔진: Drawing OCR · EasyOCR · Tesseract · RapidOCR · Windows OCR</li>
+  <li>OCR 엔진: RapidOCR(기본) · Drawing OCR · Tesseract · Windows OCR</li>
   <li>연산 장치: 자동 / GPU / CPU</li>
   <li>저장: <b>.dck</b>(재편집) + <b>.pdf</b>(레이어 토글) 동시</li>
   <li>내보내기: PNG · TIFF · PDF(OCG 레이어) · OpenRaster(.ora)</li>
@@ -143,6 +144,9 @@ highlights dimension items that have no marker.</p>
 <p style="color:#888;">© 2026 Drawing Checker · 개인/사내 검토용</p>
 """
     return f'<h2>Drawing Checker <span style="color:#888;">v{APP_VERSION}</span></h2>{body}'
+
+# 색상 선택창의 "사용자 지정 색" 기본값 — 자주 쓰는 볼펜색
+CUSTOM_PEN_COLORS = ["#000000", "#15268F", "#D81E1E", "#1E8A3C"]  # 검정·파랑·빨강·초록
 
 # 시중에서 흔한 형광펜 색상 (이름, HEX)
 PRESET_COLORS = [
@@ -422,7 +426,7 @@ class _OcrWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Drawing Checker")
+        self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(make_app_icon())
         self.resize(1280, 860)
 
@@ -435,6 +439,7 @@ class MainWindow(QMainWindow):
         self._ocr_engine = default_engine()  # 1순위 엔진(현재 Drawing OCR)
         self._ocr_langs = ("en",)  # OCR 인식 언어(고정: 숫자/영문)
         self._autocheck_on = True  # 저장 시 마킹검사 여부(재빌드에도 유지)
+        self._digits_only = False  # 숫자 포함(치수성) 항목만 검사
         self._security_on = False  # 보안(오프라인) 모드
         self._security_warn = False  # True=경고만, False=강제종료
         self._sec_seen = 0  # 경고 모드에서 표시한 위반 수
@@ -473,6 +478,7 @@ class MainWindow(QMainWindow):
         s.setValue("ocr/engine", self._ocr_engine)
         s.setValue("ocr/device", get_device())
         s.setValue("ocr/autocheck", self._autocheck_on)
+        s.setValue("ocr/digits_only", self._digits_only)
         s.setValue("security/offline", self._security_on)
         s.setValue("security/warn", self._security_warn)
         s.setValue("tool/eraser_mode", t.eraser_mode)
@@ -533,6 +539,10 @@ class MainWindow(QMainWindow):
         ac = s.value("ocr/autocheck", True, type=bool)
         self._autocheck_on = ac
         self.act_autocheck.setChecked(ac)
+        # 숫자·치수만 검사
+        do = s.value("ocr/digits_only", False, type=bool)
+        self._digits_only = do
+        self.act_digits_only.setChecked(do)
         # 보안 모드
         self._security_on = s.value("security/offline", False, type=bool)
         self._security_warn = s.value("security/warn", False, type=bool)
@@ -587,7 +597,7 @@ class MainWindow(QMainWindow):
         self._nav_unmarked = []
         self._nav_idx = -1
         self.canvas.set_document(doc)
-        self.setWindowTitle(f"Drawing Checker — {os.path.basename(path)}")
+        self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         self._update_status()
 
     # ---------- 액션/메뉴 ----------
@@ -666,6 +676,14 @@ class MainWindow(QMainWindow):
         self.act_autocheck.setToolTip(tr("저장/내보내기 전에 미마킹 항목을 자동 검사", "Auto-check unmarked items before save/export"))
         self.act_autocheck.toggled.connect(lambda v: setattr(self, "_autocheck_on", v))
 
+        self.act_digits_only = QAction(tr("숫자·치수 항목만 검사", "Check numeric items only"), self)
+        self.act_digits_only.setCheckable(True)
+        self.act_digits_only.setChecked(self._digits_only)
+        self.act_digits_only.setToolTip(
+            tr("숫자가 포함된 항목(치수/공차)만 검사하고 일반 글자는 제외",
+               "Only check items containing digits (dimensions/tolerances); skip plain words"))
+        self.act_digits_only.toggled.connect(self._on_toggle_digits_only)
+
         menu = self.menuBar()
         file_menu = menu.addMenu(tr("파일", "File"))
         file_menu.addAction(self.act_open)
@@ -690,11 +708,15 @@ class MainWindow(QMainWindow):
         check_menu.addAction(self.act_check)
         check_menu.addAction(self.act_next_unmark)
         check_menu.addAction(self.act_autocheck)
+        check_menu.addAction(self.act_digits_only)
         engine_menu = check_menu.addMenu(tr("OCR 엔진", "OCR Engine"))
         self.engine_group = QActionGroup(self)
         self.engine_group.setExclusive(True)
         self._engine_actions: dict[str, QAction] = {}
+        default_key = default_engine()
         for key, label in list_engines():
+            if key == default_key:
+                label = label + tr(" (기본)", " (default)")
             act = QAction(label, self)
             act.setCheckable(True)
             act.setChecked(key == self._ocr_engine)
@@ -703,7 +725,7 @@ class MainWindow(QMainWindow):
             engine_menu.addAction(act)
             self._engine_actions[key] = act
 
-        # 연산 장치 선택 (EasyOCR·Drawing OCR에 적용)
+        # 연산 장치 선택 (Drawing OCR 등 torch 엔진에 적용)
         device_menu = check_menu.addMenu(tr("연산 장치", "Compute Device"))
         self.device_group = QActionGroup(self)
         self.device_group.setExclusive(True)
@@ -977,10 +999,13 @@ class MainWindow(QMainWindow):
         self.security_label = QLabel("")
         self.progress_label = QLabel("")
         self.progress_label.setStyleSheet("font-weight: bold; padding: 0 8px;")
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setStyleSheet("color:#888; padding:0 8px;")
         self.status.addPermanentWidget(self.security_label)
         self.status.addPermanentWidget(self.progress_label)
         self.status.addPermanentWidget(self.page_label)
         self.status.addPermanentWidget(self.zoom_label)
+        self.status.addPermanentWidget(self.version_label)
 
     # ---------- 핸들러 ----------
     # ---------- 레이어 드롭다운 ----------
@@ -1124,16 +1149,28 @@ class MainWindow(QMainWindow):
     def _on_eraser_mode_changed(self, _index: int):
         self.canvas.tools.eraser_mode = self.eraser_mode_combo.currentData()
 
+    def _set_custom_colors(self, hex_list):
+        """색상 선택창의 '사용자 지정 색' 슬롯을 왼쪽 위부터 채운다."""
+        for i, hex_code in enumerate(hex_list):
+            c = QColor(hex_code)
+            try:
+                QColorDialog.setCustomColor(i, c)
+            except TypeError:
+                QColorDialog.setCustomColor(i, c.rgb())
+
     def _pick_pen_color(self):
-        color = QColorDialog.getColor(self.canvas.tools.pen_color, self, "펜 색상")
+        self._set_custom_colors(CUSTOM_PEN_COLORS)  # 볼펜색 4개(왼쪽 위부터)
+        color = QColorDialog.getColor(self.canvas.tools.pen_color, self,
+                                      tr("펜 색상", "Pen color"))
         if color.isValid():
             self.canvas.tools.pen_color = color
             self.pen_color_btn.setStyleSheet(_color_button_style(color))
 
     def _pick_hl_color(self):
-        color = QColorDialog.getColor(
-            self.canvas.tools.highlighter_color, self, "형광펜 색상"
-        )
+        # 형광펜: 툴바 프리셋 1~8을 사용자 지정 색에 왼쪽 위→오른쪽으로 채움
+        self._set_custom_colors([hexc for _name, hexc in PRESET_COLORS])
+        color = QColorDialog.getColor(self.canvas.tools.highlighter_color, self,
+                                      tr("형광펜 색상", "Highlighter color"))
         if color.isValid():
             self.canvas.tools.highlighter_color = color
             self.hl_color_btn.setStyleSheet(_color_button_style(color))
@@ -1180,7 +1217,7 @@ class MainWindow(QMainWindow):
         if page is None:
             self.progress_label.setText("")
             return
-        boxes = self._ocr_cache.get(self._cache_key(page))
+        boxes = self._get_boxes(page)
         if not boxes:
             self.progress_label.setText(tr("마킹: 검사 전", "Mark: not checked"))
             return
@@ -1210,7 +1247,7 @@ class MainWindow(QMainWindow):
         self._nav_unmarked = []
         self._nav_idx = -1
         self.canvas.set_document(doc)
-        self.setWindowTitle(f"Drawing Checker — {os.path.basename(path)}")
+        self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         self._update_status()
 
     def open_project(self):
@@ -1229,7 +1266,7 @@ class MainWindow(QMainWindow):
         self._nav_unmarked = []
         self._nav_idx = -1
         self.canvas.set_document(doc)
-        self.setWindowTitle(f"Drawing Checker — {os.path.basename(path)}")
+        self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         self._update_status()
 
     def save_project(self, save_as: bool):
@@ -1258,7 +1295,7 @@ class MainWindow(QMainWindow):
             return
         self._project_path = path
         self.canvas.doc.path = path
-        self.setWindowTitle(f"Drawing Checker — {os.path.basename(path)}")
+        self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         names = ", ".join(os.path.basename(w) for w in written)
         self.status.showMessage(f"저장됨({len(written)}개): {names}", 5000)
 
@@ -1480,6 +1517,26 @@ class MainWindow(QMainWindow):
     def _cache_key(self, page):
         return (id(page), self._ocr_engine, self._ocr_langs)
 
+    def _get_boxes(self, page):
+        """캐시된 OCR 박스를 반환(숫자·치수 필터 적용). 미검출이면 None."""
+        raw = self._ocr_cache.get(self._cache_key(page))
+        if raw is None:
+            return None
+        if self._digits_only:
+            return [b for b in raw if any(ch.isdigit() for ch in b.text)]
+        return raw
+
+    def _on_toggle_digits_only(self, checked: bool):
+        self._digits_only = checked
+        # 재검출 불필요(읽기 시 필터) — 표시만 갱신
+        page = self.canvas.page
+        if page is not None and self._get_boxes(page) is not None:
+            unmarked = find_unmarked(page, self._get_boxes(page))
+            self.canvas.set_overlay_rects([it.rect for it in unmarked])
+            self._nav_unmarked = unmarked
+            self._nav_idx = -1
+        self._update_progress()
+
     def _ensure_boxes(self, pages, title: str) -> bool:
         """필요한 페이지의 OCR을 백그라운드로 수행(진행률·취소). 완료 True/취소 False.
 
@@ -1515,7 +1572,7 @@ class MainWindow(QMainWindow):
             return None
         result = []
         for pi, page in enumerate(pages):
-            boxes = self._ocr_cache[self._cache_key(page)]
+            boxes = self._get_boxes(page)
             for it in find_unmarked(page, boxes):
                 result.append((pi, it))
         elapsed = time.perf_counter() - t0
@@ -1541,7 +1598,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, tr("마킹검사 실패", "Mark check failed"),
                                  tr("OCR 실행 중 오류:\n", "OCR error:\n") + str(exc))
             return
-        boxes = self._ocr_cache[self._cache_key(page)]
+        boxes = self._get_boxes(page)
         elapsed = time.perf_counter() - t0
         note = tr("캐시", "cached") if cached else f"{elapsed:.2f}s"
         self.status.showMessage(tr(
@@ -1616,7 +1673,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "자동마킹 실패", f"OCR 실행 중 오류:\n{exc}")
                 return
-        boxes = self._ocr_cache[key]
+        boxes = self._get_boxes(page) or []
         pt = QPoint(int(img_pt.x()), int(img_pt.y()))
         # 점을 포함하는 가장 작은 박스 선택
         cands = [it for it in boxes if it.rect.contains(pt)]

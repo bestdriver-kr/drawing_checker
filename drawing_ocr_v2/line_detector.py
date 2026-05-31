@@ -236,6 +236,64 @@ def split_box_into_lines(
     return out
 
 
+def _is_fake_valley_pattern(img_rgb: np.ndarray,
+                            bands: List[Tuple[int, int]]) -> bool:
+    """Heuristic: detect the "big nominal + small side-stacked tolerance"
+    layout where horizontal projection finds a false valley running
+    through the centre of a tall glyph.  When this pattern is present
+    the bands list will look like a stacked layout but the valley row
+    actually has heavy ink on one side of the image.
+
+    Returns True iff the gap row between any two adjacent bands carries
+    significant ink on at least one horizontal half — i.e. the gap is
+    not really a gap, just an internal glyph hole.
+
+    When True, the caller should keep the crop as a SINGLE band so the
+    CRNN can read it as one multi-value line (we synth-train this exact
+    case in `_render_nominal_with_side_stacked_tol`).
+    """
+    if len(bands) < 2:
+        return False
+    if img_rgb.ndim == 2:
+        gray = img_rgb
+    else:
+        gray = img_rgb.mean(axis=2).astype(np.uint8)
+    # Binarise once for fast ink-density queries.
+    try:
+        import cv2
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        eq = clahe.apply(gray)
+        inv = (255 - eq) if eq.mean() > 128 else eq
+        _, bw = cv2.threshold(inv, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    except ImportError:
+        bw = ((255 - gray) if gray.mean() > 128 else gray)
+        bw = (bw > bw.mean()).astype(np.uint8) * 255
+    h, w = bw.shape
+    half_w = max(1, w // 2)
+    for (s0, e0), (s1, e1) in zip(bands[:-1], bands[1:]):
+        gap_y0 = e0
+        gap_y1 = s1
+        if gap_y1 <= gap_y0:
+            continue
+        gap = bw[gap_y0:gap_y1, :]
+        if gap.size == 0:
+            continue
+        # Per-half average ink density inside the supposed gap.
+        left_density = gap[:, :half_w].mean() / 255.0
+        right_density = gap[:, half_w:].mean() / 255.0
+        # Fake valley = strong asymmetry.  One side has heavy ink (big
+        # glyph centre running through the row) while the other is mostly
+        # empty (the actual gap between the small stacked tolerances).
+        # True stacked layouts have ink on both halves or neither —
+        # symmetric.
+        heavy_side = max(left_density, right_density)
+        light_side = min(left_density, right_density)
+        if heavy_side > 0.10 and heavy_side > 3.0 * max(light_side, 0.01):
+            return True
+    return False
+
+
 def detect_lines_on_whole(
     img_rgb: np.ndarray,
     **kwargs,
@@ -243,6 +301,10 @@ def detect_lines_on_whole(
     """Fallback when the CRAFT detector misses everything: scan the whole
     image with the projection splitter and return each band as a full-width
     bbox.  Returned format matches `split_box_into_lines`.
+
+    Special case: if a "fake valley" pattern is detected (big-nominal +
+    side-stacked tolerance), collapse to a SINGLE full-image band so the
+    CRNN reads it as one multi-value line.
     """
     h, w = img_rgb.shape[:2]
     bands = find_text_line_bands(img_rgb, **kwargs)

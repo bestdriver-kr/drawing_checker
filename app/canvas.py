@@ -384,13 +384,9 @@ class Canvas(QWidget):
         return True
 
     def center_on_image_rect(self, rect):
-        """이미지 좌표 사각형이 화면 중앙에 보이도록 줌·이동."""
+        """현재 줌은 그대로 두고, 사각형이 화면 중앙에 오도록 이동(스크롤)만 한다."""
         if rect.width() <= 0 or rect.height() <= 0:
             return
-        margin = 0.35  # 사각형이 화면의 약 1/3 차지
-        sx = self.width() * margin / rect.width()
-        sy = self.height() * margin / rect.height()
-        self.scale = max(MIN_SCALE, min(MAX_SCALE, min(sx, sy)))
         cx, cy = rect.center().x(), rect.center().y()
         self.offset = QPointF(self.width() / 2 - cx * self.scale,
                               self.height() / 2 - cy * self.scale)

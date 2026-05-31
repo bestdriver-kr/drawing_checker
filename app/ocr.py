@@ -133,8 +133,13 @@ def list_engines() -> list[tuple[str, str]]:
     return [(e.key, e.label) for e in engines]
 
 
+DEFAULT_ENGINE_KEY = "rapidocr"  # 시작 시 기본 선택 엔진
+
+
 def default_engine() -> str:
-    """기본 엔진 키 — priority가 가장 높은(작은) 엔진."""
+    """기본 엔진 키. 지정 엔진이 등록돼 있으면 그것, 아니면 priority 최상위."""
+    if DEFAULT_ENGINE_KEY in _ENGINES:
+        return DEFAULT_ENGINE_KEY
     engines = list_engines()
     return engines[0][0] if engines else ENGINE_EASYOCR
 
@@ -183,12 +188,29 @@ class EasyOcrEngine(OcrEngine):
         except Exception as exc:  # noqa: BLE001
             return False, f"easyocr 모듈을 불러올 수 없습니다: {exc}"
 
+    @staticmethod
+    def _bundled_model_dir():
+        """PyInstaller로 동봉된 EasyOCR 모델 폴더(있으면). 없으면 None."""
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            d = os.path.join(base, "easyocr_model")
+            if os.path.isdir(d):
+                return d
+        return None
+
     def _reader_for(self, langs):
         gpu = use_gpu()
         key = (langs, gpu)
         if self._reader is None or self._reader_key != key:
             import easyocr  # 무거운 import는 지연
-            self._reader = easyocr.Reader(list(langs), gpu=gpu)
+            model_dir = self._bundled_model_dir()
+            if model_dir:
+                # 동봉 모델 사용 + 다운로드 비활성(오프라인/보안 친화)
+                self._reader = easyocr.Reader(
+                    list(langs), gpu=gpu,
+                    model_storage_directory=model_dir, download_enabled=False)
+            else:
+                self._reader = easyocr.Reader(list(langs), gpu=gpu)
             self._reader_key = key
         return self._reader
 
@@ -276,6 +298,7 @@ class TesseractEngine(OcrEngine):
 class RapidOcrEngine(OcrEngine):
     key = "rapidocr"
     label = "RapidOCR (ONNX·빠름)"
+    priority = -10  # OCR 엔진 목록 최상위(기본 엔진)
 
     def __init__(self):
         self._engine = None
@@ -412,7 +435,9 @@ async def _win_recognize(png: bytes, langs) -> list[tuple[str, QRect]]:
 ENGINE_EASYOCR = EasyOcrEngine.key
 ENGINE_TESSERACT = TesseractEngine.key
 
-register_engine(EasyOcrEngine())
+# EasyOCR은 사전학습 검출모델(CRAFT)의 상업적 사용 불확실성 때문에 미등록(메뉴 제외).
+# 필요 시 아래 주석을 해제하면 다시 사용 가능.
+# register_engine(EasyOcrEngine())
 register_engine(TesseractEngine())
 register_engine(RapidOcrEngine())
 register_engine(WindowsOcrEngine())

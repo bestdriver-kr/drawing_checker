@@ -51,13 +51,13 @@ python main.py
 - 툴바/메뉴의 **마킹검사**(돋보기+체크 아이콘): 현재 페이지를 검사해 미마킹 항목을 **빨간 점선**으로 표시하고 목록을 보여줍니다.
 - **저장/내보내기 시 자동 검사**: 미마킹 항목이 있으면 경고하고 계속/취소를 묻습니다. `검사 → 저장 시 마킹검사` 메뉴로 끌 수 있습니다.
 - **마킹 판정**: 텍스트 영역에 보이는 주석 레이어 픽셀이 **조금이라도 닿으면** 마킹된 것으로 봅니다(숨긴 레이어는 미마킹으로 간주).
-- **OCR 엔진 선택**(`검사 → OCR 엔진`):
-  - **EasyOCR**: 딥러닝 기반, 정확도 높음. 첫 실행 시 모델 다운로드(~100MB), 페이지당 수초.
-  - **Tesseract**: 가볍고 빠름(페이지당 0.x초). `tesseract.exe` 설치 필요(`winget install UB-Mannheim.TesseractOCR`). 미설치 시 선택하면 설치 안내가 뜹니다.
-  - **RapidOCR**: ONNX 기반, 빠르고 설치 간단(모델 동봉). `pip install rapidocr_onnxruntime`.
-  - **Windows OCR**: Windows 내장 OCR(winrt). 매우 빠르고 추가 설치 불필요. 설치된 OS 언어 팩(en/ko 등)을 사용합니다.
-  - **Drawing OCR (도면 치수 전용)**: 동봉한 CRNN 모델. 숫자·공차기호(± Ø °)·ISO 286 끼워맞춤 코드(H7, g6) 등 **치수 텍스트에 특화**. 패키지 `drawing_ocr/`와 `models/drawing_crnn.pt`가 함께 들어 있어 별도 설치가 필요 없습니다(torch·opencv는 EasyOCR과 공유).
+- **OCR 엔진 선택**(`검사 → OCR 엔진`) — 모두 상업적 사용에 자유로운 엔진:
+  - **RapidOCR (기본)**: ONNX 기반, 빠르고 모델 동봉(Apache-2.0). 별도 설치 불필요.
+  - **Drawing OCR (도면 치수 전용)**: 동봉한 자체 개발 CRNN 모델. 숫자·공차기호(± Ø °)·ISO 286 끼워맞춤 코드(H7, g6) 등 **치수 텍스트에 특화**.
+  - **Tesseract**: 가볍고 빠름. `tesseract.exe` 설치 필요(`winget install UB-Mannheim.TesseractOCR`).
+  - **Windows OCR**: Windows 내장 OCR(winrt). 매우 빠르고 추가 설치 불필요.
   - 엔진을 바꾸면 결과 캐시를 비우고 다시 검출합니다. 페이지·엔진별로 결과를 캐시합니다.
+  - (EasyOCR은 사전학습 검출모델의 상업적 사용 불확실성 때문에 기본 제외했습니다.)
 
 ### OCR 엔진 직접 추가하기
 

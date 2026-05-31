@@ -8,6 +8,11 @@ venv/
 # 학습 모델(용량 큼·유출 주의) — 별도 배포
 models/
 *.pt
+*.safetensors
+
+# 원본 스냅샷 복사본(중복) — 저장소에는 drawing_ocr_v2/ 만 둔다
+drawing_ocr_standalone_v2/
+drawing_ocr_standalone/
 
 # 보안 모드 로그 / 생성물
 security_block.log
@@ -26,7 +31,6 @@ Thumbs.db
 .idea/
 .vscode/
 
-# PyInstaller
+# PyInstaller (build_exe.spec은 추적함)
 build/
 dist/
-*.spec

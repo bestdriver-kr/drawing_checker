@@ -1,52 +1,57 @@
-"""사용자 정의 OCR 엔진 등록 파일 (app/ocr.py가 시작 시 자동 로드).
+"""사용자 정의 OCR 엔진 등록 (app/ocr.py가 시작 시 자동 로드).
 
-여기서는 동봉한 도면 치수 전용 엔진 `drawing_ocr`(CRNN)을 우리 앱의
-OCR 엔진으로 등록한다. 다른 엔진을 추가하려면 OcrEngine을 상속한 클래스를
-만들어 register_engine(...) 하면 된다(아래 예시 클래스 참고).
-
-엔진 계약(OcrEngine)
-  - key / label
-  - is_available() -> (bool, 사유)
-  - detect(base: QImage, langs, min_conf) -> list[TextItem]
-        rect 는 반드시 **배경 이미지의 픽셀 좌표** QRect.
+동봉한 도면 치수 전용 엔진 `drawing_ocr_v2`를 두 가지 인식기로 등록한다:
+  - Drawing OCR (TrOCR·정확): 파인튜닝 TrOCR, 정확도 높음, 느림(GPU 권장)
+  - Drawing OCR (CRNN·빠름): 자체 CRNN, 가볍고 빠름(CPU도 OK), 정확도 보통
+둘 다 검출은 자체 Projection/CRAFT_Lite를 쓰며 EasyOCR에 의존하지 않는다.
 """
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
-from .ocr import OcrEngine, TextItem, qimage_to_rgb, register_engine, use_gpu
+from .ocr import (
+    OcrEngine,
+    TextItem,
+    cuda_available,
+    qimage_to_rgb,
+    register_engine,
+    use_gpu,
+)
 
-# 프로젝트 루트(= drawing_ocr 패키지가 있는 곳)를 import 경로에 추가
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# variant 태그에서 업스케일 배율(x8 등)을 추출 → bbox를 원본 좌표로 환원
-_SCALE_RE = re.compile(r"x([0-9.]+)")
+# PyInstaller로 묶인 경우 동봉 데이터는 sys._MEIPASS 아래.
+_DATA_ROOT = getattr(sys, "_MEIPASS", _PROJECT_ROOT)
+
+
+def _models_dir() -> str:
+    for base in (_DATA_ROOT, _PROJECT_ROOT):
+        d = os.path.join(base, "models")
+        if os.path.isdir(d):
+            return d
+    return os.path.join(_DATA_ROOT, "models")
 
 
 class DrawingDimensionEngine(OcrEngine):
-    """도면 치수 전용 CRNN OCR (drawing_ocr 패키지).
+    """도면 치수 전용 OCR v2 (자체 개발). recognizer로 TrOCR/CRNN 선택."""
 
-    숫자·공차기호(± Ø ° 등)·ISO 286 끼워맞춤 코드(H7, g6 …)에 특화.
-    일반 문장보다 치수/공차 텍스트 검출에 강하다.
-    """
-
-    key = "drawing_dim"
-    label = "Drawing OCR (도면 치수 전용)"
-    priority = 0  # 메뉴 1순위 + 기본 엔진
-
-    def __init__(self):
+    def __init__(self, recognizer: str, key: str, label: str, priority: int,
+                 force_device: str, trocr_model: str | None = None):
+        self.recognizer = recognizer       # "trocr" | "crnn"
+        self.force_device = force_device   # "gpu" | "cpu" | "auto"(메뉴 따름)
+        # trocr_model: None=동봉 파인튜닝 모델, 그 외=경로/HF ID(예: 범용 기본 모델)
+        self.trocr_model = trocr_model
+        self.key = key
+        self.label = label
+        self.priority = priority
         self._ocr = None
         self._built_device = None
-
-    def _model_path(self) -> str:
-        return os.path.join(_PROJECT_ROOT, "models", "drawing_crnn.pt")
 
     def is_available(self) -> tuple[bool, str]:
         try:
@@ -54,75 +59,63 @@ class DrawingDimensionEngine(OcrEngine):
         except Exception as exc:  # noqa: BLE001
             return False, f"torch가 설치되어 있지 않습니다: {exc}"
         try:
-            import drawing_ocr  # noqa: F401
+            import drawing_ocr_v2  # noqa: F401
         except Exception as exc:  # noqa: BLE001
-            return False, (
-                "drawing_ocr 패키지를 불러올 수 없습니다.\n"
-                "프로젝트 루트에 drawing_ocr/ 폴더가 있어야 합니다.\n"
-                f"({exc})"
-            )
-        if not os.path.isfile(self._model_path()):
-            return False, f"모델 파일이 없습니다:\n{self._model_path()}"
+            return False, f"drawing_ocr_v2 패키지를 불러올 수 없습니다: {exc}"
+        md = _models_dir()
+        if self.recognizer == "trocr":
+            try:
+                import transformers  # noqa: F401
+            except Exception as exc:  # noqa: BLE001
+                return False, f"transformers가 설치되어 있지 않습니다: {exc}"
+            # 동봉 파인튜닝 모델을 쓰는 경우에만 폴더 확인(범용 모델은 캐시/허브에서 로드)
+            if self.trocr_model is None and not os.path.isdir(
+                    os.path.join(md, "trocr_finetuned")):
+                return False, f"TrOCR 모델 폴더가 없습니다:\n{md}/trocr_finetuned"
+        else:  # crnn
+            if not os.path.isfile(os.path.join(md, "drawing_crnn.pt")):
+                return False, f"CRNN 모델이 없습니다:\n{md}/drawing_crnn.pt"
         return True, ""
 
     def _engine(self):
-        device = "cuda" if use_gpu() else "cpu"  # 장치 선택 반영
+        if self.force_device == "gpu":
+            device = "cuda" if cuda_available() else "cpu"
+        elif self.force_device == "auto":
+            device = "cuda" if use_gpu() else "cpu"  # 연산 장치 메뉴 따름
+        else:  # "cpu"
+            device = "cpu"
         if self._ocr is None or self._built_device != device:
-            from drawing_ocr import DrawingOCR
-            self._ocr = DrawingOCR(model_path=self._model_path(), device=device)
+            from drawing_ocr_v2 import OCR
+            md = _models_dir()
+            trocr_path = self.trocr_model or os.path.join(md, "trocr_finetuned")
+            self._ocr = OCR(
+                detector="projection",
+                recognizer=self.recognizer,
+                trocr_model_path=trocr_path,
+                crnn_model_path=os.path.join(md, "drawing_crnn.pt"),
+                craft_lite_path=os.path.join(md, "craft_lite.pt"),
+                device=device,
+            )
             self._built_device = device
         return self._ocr
 
     def detect(self, base: QImage, langs, min_conf: float) -> list[TextItem]:
         rgb = qimage_to_rgb(base)
-        results = self._engine().recognize_image(rgb)
         items: list[TextItem] = []
-        for text, conf, bbox, tag in results:
+        for text, conf, bbox in self._engine().recognize(rgb):
             text = (text or "").strip()
-            if not text or conf < min_conf:
-                continue
-            # bbox(4점 폴리곤)는 전처리 variant 좌표 → 배율로 나눠 원본 좌표화
-            m = _SCALE_RE.search(tag or "")
-            scale = float(m.group(1)) if m else 1.0
-            xs = [p[0] / scale for p in bbox]
-            ys = [p[1] / scale for p in bbox]
-            rect = QRect(
-                int(min(xs)), int(min(ys)),
-                int(max(xs) - min(xs)), int(max(ys) - min(ys)),
-            )
-            items.append(TextItem(text, rect, float(conf)))
-        return _dedup_overlapping(items)
+            if not text or conf < min_conf or not bbox:
+                continue  # 회전 패스 등 좌표 없는 결과는 제외
+            x0, y0, x1, y1 = bbox  # (x_min, y_min, x_max, y_max)
+            items.append(TextItem(
+                text, QRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0)), float(conf)))
+        return items
 
 
-def _iou(a: QRect, b: QRect) -> float:
-    inter = a.intersected(b)
-    if inter.isEmpty():
-        return 0.0
-    ia = inter.width() * inter.height()
-    ua = a.width() * a.height() + b.width() * b.height() - ia
-    return ia / ua if ua > 0 else 0.0
-
-
-def _dedup_overlapping(items: list[TextItem], iou_thresh: float = 0.3) -> list[TextItem]:
-    """여러 variant에서 나온 동일 위치 중복 박스를 신뢰도 높은 것 하나로 정리."""
-    kept: list[TextItem] = []
-    for it in sorted(items, key=lambda x: -x.conf):
-        if any(_iou(it.rect, k.rect) > iou_thresh for k in kept):
-            continue
-        kept.append(it)
-    return kept
-
-
-register_engine(DrawingDimensionEngine())
-
-
-# ───────────────────────── 다른 엔진을 더 추가하고 싶다면 ─────────────────────────
-# class MyEngine(OcrEngine):
-#     key = "myengine"
-#     label = "내 OCR"
-#     def is_available(self): return True, ""
-#     def detect(self, base, langs, min_conf):
-#         rgb = qimage_to_rgb(base)           # (h,w,3) numpy, 원본 픽셀 좌표
-#         # ... 본인 엔진 호출 → 결과를 TextItem(text, QRect(...), conf)로 ...
-#         return []
-# register_engine(MyEngine())
+register_engine(DrawingDimensionEngine(
+    "trocr", "drawing_trocr", "Drawing OCR (자체개발·타입1·정확)", 0, "gpu"))
+register_engine(DrawingDimensionEngine(
+    "crnn", "drawing_crnn", "Drawing OCR (자체개발·타입2·빠름)", 1, "auto"))
+register_engine(DrawingDimensionEngine(
+    "trocr", "trocr_generic", "TrOCR (범용 인쇄체·GPU)", 2, "gpu",
+    trocr_model="microsoft/trocr-small-printed"))
