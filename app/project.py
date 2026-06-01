@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import zlib
 import zipfile
@@ -219,6 +220,10 @@ def save_dck(doc: Document, path: str) -> None:
                         "width": s.width,
                         "opacity": s.opacity,
                         "points": [[x, y] for x, y in s.points],
+                        **({"mask": base64.b64encode(s.mask).decode("ascii")}
+                           if s.mask else {}),
+                        **({"text": s.text} if s.text else {}),
+                        **({"angle": s.angle} if s.angle else {}),
                     } for s in layer.strokes],
                 })
             manifest["pages"].append(page_meta)
@@ -263,6 +268,9 @@ def load_dck(path: str) -> Document:
                         width=sd["width"],
                         opacity=sd["opacity"],
                         points=[(px, py) for px, py in sd["points"]],
+                        mask=(base64.b64decode(sd["mask"]) if sd.get("mask") else None),
+                        text=sd.get("text", ""),
+                        angle=float(sd.get("angle", 0.0)),
                     )
                     for sd in lm.get("strokes", [])
                 ]

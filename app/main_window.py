@@ -8,6 +8,7 @@ from PySide6.QtCore import (
     QEventLoop,
     QPoint,
     QPointF,
+    QRect,
     QRectF,
     QSettings,
     QSize,
@@ -20,7 +21,9 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QGuiApplication,
     QIcon,
+    QImage,
     QKeySequence,
     QPainter,
     QPen,
@@ -30,16 +33,23 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QScrollBar,
     QSlider,
+    QTextBrowser,
     QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from .canvas import (
@@ -47,8 +57,10 @@ from .canvas import (
     ERASE_MODE_STROKE,
     TOOL_AUTOMARK,
     TOOL_ERASER,
+    TOOL_HAND,
     TOOL_HIGHLIGHTER,
     TOOL_PEN,
+    TOOL_TEXT,
     WIDTH_PCT,
     WIDTH_PX,
     Canvas,
@@ -78,7 +90,7 @@ from .project import (
     save_bundle,
 )
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 APP_TITLE = f"Drawing Checker v{APP_VERSION}"
 
 # ---------------------------------------------------------------- UI 언어(i18n)
@@ -118,8 +130,6 @@ highlights dimension items that have no marker.</p>
   <li>Tools: pen · highlighter · eraser (whole-stroke / pixel)</li>
   <li>Layers: add·delete·reorder·show/hide·opacity·blend (multiply)</li>
   <li>Mark check (OCR): finds unmarked text (red dashed) / warns on save</li>
-  <li>OCR engines: RapidOCR (default) · Drawing OCR · Tesseract · Windows OCR</li>
-  <li>Compute device: Auto / GPU / CPU</li>
   <li>Save: <b>.dck</b> (re-editable) + <b>.pdf</b> (toggle layers) together</li>
   <li>Export: PNG · TIFF · PDF (OCG layers) · OpenRaster (.ora)</li>
 </ul>
@@ -136,8 +146,6 @@ highlights dimension items that have no marker.</p>
   <li>도구: 펜 · 형광펜 · 지우개(획 전체 / 부분)</li>
   <li>레이어: 추가·삭제·순서·표시숨김·불투명도·블렌드(멀티플라이)</li>
   <li>마킹검사(OCR): 미마킹 텍스트를 빨간 점선으로 표시 / 저장 시 경고</li>
-  <li>OCR 엔진: RapidOCR(기본) · Drawing OCR · Tesseract · Windows OCR</li>
-  <li>연산 장치: 자동 / GPU / CPU</li>
   <li>저장: <b>.dck</b>(재편집) + <b>.pdf</b>(레이어 토글) 동시</li>
   <li>내보내기: PNG · TIFF · PDF(OCG 레이어) · OpenRaster(.ora)</li>
 </ul>
@@ -145,10 +153,120 @@ highlights dimension items that have no marker.</p>
 """
     return f'<h2>Drawing Checker <span style="color:#888;">v{APP_VERSION}</span></h2>{body}'
 
+
+def help_html() -> str:
+    """사용법 및 단축키 안내(언어별)."""
+    if _UI_LANG == "en":
+        body = """
+<b>Getting started</b>
+<ol>
+  <li>File → Open (Ctrl+O): load PDF · TIF · PNG · JPG · BMP (or drag & drop).</li>
+  <li>Pick a tool, color and width on the toolbar, then drag on the canvas.</li>
+  <li>Use the layer dropdown to choose/add layers; mark dimensions per layer.</li>
+  <li>File → Save (Ctrl+S): writes <b>.dck</b> (re-editable) + <b>.pdf</b> together.</li>
+</ol>
+<b>Tools</b>
+<ul>
+  <li><b>Hand (Space)</b>: left-drag to move the view (pan).</li>
+  <li><b>Pen / Highlighter</b>: drag to draw. Highlighter is semi-transparent.</li>
+  <li><b>Text (T)</b>: click to place text. Color = pen color, size = width spin.</li>
+  <li><b>Eraser (E)</b>: removes a whole stroke (or pixels in pixel mode).
+      Or <b>hold X</b> for a temporary eraser — release to revert to the previous tool.</li>
+  <li><b>Auto-mark (A)</b>: click a detected number to highlight it. Fills the whole
+      text box, or glyph shapes only (Check → Auto-mark fill). Re-marking a marked
+      box adds the new color over the bottom half (e.g. yellow / red two stripes).</li>
+</ul>
+<b>Moving around a large drawing</b>
+<ul>
+  <li><b>Scrollbars</b> appear at the right/bottom when zoomed in — drag to move.</li>
+  <li><b>Arrow keys</b>: pan in small steps; <b>Ctrl+Arrow</b>: large steps.</li>
+  <li><b>Hand tool (Space)</b> left-drag, or <b>Ctrl+drag</b> / wheel-click drag.</li>
+  <li><b>Wheel</b>: zoom at the cursor. <b>Ctrl+0</b>: fit to window.</li>
+</ul>
+<b>Text paste & rotate</b>
+<ul>
+  <li>Copy text anywhere, press <b>Ctrl+V</b> → it follows the cursor; click to place.</li>
+  <li><b>PageUp / PageDown</b>: rotate the text 90° clockwise / counter-clockwise.</li>
+  <li><b>Esc</b>: cancel a pending paste.</li>
+</ul>
+<b>Mark check (OCR)</b>
+<ul>
+  <li>Check menu / toolbar: finds text with no marker (red dashed) and lists them.</li>
+  <li><b>N</b>: jump to the next unmarked item. Warns on save if any remain.</li>
+</ul>
+<b>Keyboard shortcuts</b>
+<table cellpadding="3">
+  <tr><td><b>Ctrl+O</b></td><td>Open image</td><td><b>Ctrl+Shift+O</b></td><td>Open project</td></tr>
+  <tr><td><b>Ctrl+S</b></td><td>Save project</td><td><b>Ctrl+Shift+S</b></td><td>Save as</td></tr>
+  <tr><td><b>Ctrl+E</b></td><td>Export PNG</td><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
+  <tr><td><b>Ctrl+Z</b></td><td>Undo</td><td><b>Ctrl+Y</b></td><td>Redo</td></tr>
+  <tr><td><b>Ctrl+0</b></td><td>Fit to window</td><td><b>Ctrl+V</b></td><td>Paste text</td></tr>
+  <tr><td><b>Space</b></td><td>Hand (pan) tool</td><td><b>P / H / T</b></td><td>Pen / Highlighter / Text</td></tr>
+  <tr><td><b>E / A</b></td><td>Eraser / Auto-mark</td><td><b>N</b></td><td>Next unmarked</td></tr>
+  <tr><td><b>X</b> (hold)</td><td>Temporary eraser while held</td><td><b>▲ / ▼</b></td><td>Select layer above / below</td></tr>
+  <tr><td><b>Arrows</b></td><td>Pan (Ctrl = large)</td><td><b>PageUp/Down</b></td><td>Rotate text 90°</td></tr>
+  <tr><td><b>Wheel</b></td><td>Zoom at cursor</td><td><b>Ctrl+drag</b></td><td>Pan (or wheel-drag)</td></tr>
+</table>
+"""
+    else:
+        body = """
+<b>기본 사용</b>
+<ol>
+  <li>파일 → 이미지 열기(Ctrl+O): PDF · TIF · PNG · JPG · BMP (드래그앤드롭도 가능).</li>
+  <li>툴바에서 도구·색상·굵기를 고르고 캔버스에서 드래그해 그립니다.</li>
+  <li>레이어 드롭다운으로 레이어를 선택/추가하며 레이어별로 마킹합니다.</li>
+  <li>파일 → 저장(Ctrl+S): <b>.dck</b>(재편집)와 <b>.pdf</b>를 함께 저장합니다.</li>
+</ol>
+<b>도구</b>
+<ul>
+  <li><b>이동(손, Space)</b>: 좌클릭 드래그로 화면을 끌어 이동(팬).</li>
+  <li><b>펜 / 형광펜</b>: 드래그로 그립니다. 형광펜은 반투명.</li>
+  <li><b>텍스트(T)</b>: 클릭해 글자 입력. 색=펜 색, 크기=굵기 값.</li>
+  <li><b>지우개(E)</b>: 획 전체를 지웁니다(부분 지우기 모드도 있음).
+      또는 <b>X를 누르고 있는 동안</b>만 임시 지우개 — 떼면 이전 도구로 복귀.</li>
+  <li><b>자동마킹(A)</b>: 검출된 숫자를 클릭하면 형광 칠. 텍스트 박스 전체 또는
+      글자 모양만 선택 가능(검사 → 자동마킹 채우기). 이미 마킹된 박스를 다시
+      칠하면 아래 절반에 새 색이 겹쳐(예: 위 노랑 / 아래 빨강 두 줄).</li>
+</ul>
+<b>큰 도면에서 화면 이동</b>
+<ul>
+  <li>확대하면 오른쪽·아래에 <b>스크롤바</b>가 생깁니다 — 드래그로 이동.</li>
+  <li><b>방향키</b>: 조금씩 이동 / <b>Ctrl+방향키</b>: 크게 이동.</li>
+  <li><b>손 도구(Space)</b> 좌드래그, 또는 <b>Ctrl+드래그</b> / 휠클릭 드래그.</li>
+  <li><b>휠</b>: 커서 기준 확대/축소. <b>Ctrl+0</b>: 화면맞춤.</li>
+</ul>
+<b>텍스트 붙여넣기 · 회전</b>
+<ul>
+  <li>다른 곳에서 복사 후 <b>Ctrl+V</b> → 글자가 커서를 따라옵니다. 클릭해 배치.</li>
+  <li><b>PageUp / PageDown</b>: 텍스트를 시계 / 반시계 방향으로 90° 회전.</li>
+  <li><b>Esc</b>: 붙여넣기 대기 취소.</li>
+</ul>
+<b>마킹검사 (OCR)</b>
+<ul>
+  <li>검사 메뉴/툴바: 마커 없는 텍스트를 빨간 점선으로 표시하고 목록을 보여줍니다.</li>
+  <li><b>N</b>: 다음 미마킹 항목으로 이동. 저장 시 남아 있으면 경고합니다.</li>
+</ul>
+<b>키보드 단축키</b>
+<table cellpadding="3">
+  <tr><td><b>Ctrl+O</b></td><td>이미지 열기</td><td><b>Ctrl+Shift+O</b></td><td>프로젝트 열기</td></tr>
+  <tr><td><b>Ctrl+S</b></td><td>프로젝트 저장</td><td><b>Ctrl+Shift+S</b></td><td>다른 이름으로 저장</td></tr>
+  <tr><td><b>Ctrl+E</b></td><td>PNG 내보내기</td><td><b>Ctrl+Q</b></td><td>종료</td></tr>
+  <tr><td><b>Ctrl+Z</b></td><td>실행취소</td><td><b>Ctrl+Y</b></td><td>다시실행</td></tr>
+  <tr><td><b>Ctrl+0</b></td><td>화면맞춤</td><td><b>Ctrl+V</b></td><td>텍스트 붙여넣기</td></tr>
+  <tr><td><b>Space</b></td><td>이동(손) 도구</td><td><b>P / H / T</b></td><td>펜 / 형광펜 / 텍스트</td></tr>
+  <tr><td><b>E / A</b></td><td>지우개 / 자동마킹</td><td><b>N</b></td><td>다음 미마킹</td></tr>
+  <tr><td><b>X</b>(누름)</td><td>누르는 동안 임시 지우개</td><td><b>▲ / ▼</b></td><td>위 / 아래 레이어 선택</td></tr>
+  <tr><td><b>방향키</b></td><td>화면 이동(Ctrl=크게)</td><td><b>PageUp/Down</b></td><td>텍스트 90° 회전</td></tr>
+  <tr><td><b>휠</b></td><td>커서 기준 확대/축소</td><td><b>Ctrl+드래그</b></td><td>화면 이동(휠클릭 드래그도)</td></tr>
+</table>
+"""
+    title = tr("사용법 및 단축키", "How to use & shortcuts")
+    return f'<h2>{title}</h2>{body}'
+
 # 색상 선택창의 "사용자 지정 색" 기본값 — 자주 쓰는 볼펜색
 CUSTOM_PEN_COLORS = ["#000000", "#15268F", "#D81E1E", "#1E8A3C"]  # 검정·파랑·빨강·초록
 
-# 시중에서 흔한 형광펜 색상 (이름, HEX)
+# 시중에서 흔한 형광펜 색상 (이름, HEX) — 사용자 지정 색 윗줄 좌→우 순서
 PRESET_COLORS = [
     ("형광 노랑", "#FFF200"),
     ("형광 분홍", "#FF4FA3"),
@@ -185,6 +303,20 @@ def _make_tool_icon(kind: str) -> QIcon:
         p.drawLine(QPointF(8, 24), QPointF(24, 8))
         p.setPen(QPen(QColor(120, 110, 0), 1))
         p.drawLine(QPointF(8, 24), QPointF(24, 8))
+    elif kind == TOOL_TEXT:
+        # 텍스트: 굵은 'T'
+        p.setPen(QPen(QColor(40, 40, 40), 3))
+        p.drawLine(QPointF(8, 8), QPointF(24, 8))    # 가로획
+        p.drawLine(QPointF(16, 8), QPointF(16, 25))  # 세로획
+    elif kind == TOOL_HAND:
+        # 손바닥: 손바닥 + 손가락 4개 + 엄지
+        p.setPen(QPen(QColor(70, 70, 70), 1.3))
+        p.setBrush(QColor(247, 214, 175))
+        p.drawRoundedRect(QRectF(10, 14, 13, 12), 3, 3)        # 손바닥
+        for i, fx in enumerate((10.6, 13.7, 16.8, 19.9)):      # 손가락
+            top = 7 if i in (1, 2) else 9
+            p.drawRoundedRect(QRectF(fx, top, 2.5, 16 - top + 5), 1.2, 1.2)
+        p.drawRoundedRect(QRectF(6, 16.5, 6, 2.8), 1.3, 1.3)   # 엄지
     else:  # 지우개
         p.setBrush(QColor(255, 150, 170))
         p.setPen(QPen(QColor(70, 70, 70), 1.5))
@@ -387,7 +519,7 @@ def _make_action_icon(kind: str) -> QIcon:
 def _color_button_style(color: QColor) -> str:
     return (
         f"background-color: {color.name()}; border: 1px solid #888; "
-        f"min-width: 35px; min-height: 25px;"
+        f"min-width: 40px; min-height: 29px;"
     )
 
 
@@ -431,7 +563,20 @@ class MainWindow(QMainWindow):
         self.resize(1280, 860)
 
         self.canvas = Canvas(self)
-        self.setCentralWidget(self.canvas)
+        # 캔버스 + 스크롤바(가로/세로)를 격자에 배치
+        central = QWidget(self)
+        grid = QGridLayout(central)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        grid.addWidget(self.canvas, 0, 0)
+        self.vbar = QScrollBar(Qt.Orientation.Vertical, central)
+        self.hbar = QScrollBar(Qt.Orientation.Horizontal, central)
+        grid.addWidget(self.vbar, 0, 1)
+        grid.addWidget(self.hbar, 1, 0)
+        self.setCentralWidget(central)
+        self._scroll_sync = False
+        self.hbar.valueChanged.connect(self._on_hbar)
+        self.vbar.valueChanged.connect(self._on_vbar)
         self.setAcceptDrops(True)  # 파일 끌어다 놓기로 열기
         self._layer_controls_updating = False
         self._project_path: str | None = None
@@ -440,19 +585,29 @@ class MainWindow(QMainWindow):
         self._ocr_langs = ("en",)  # OCR 인식 언어(고정: 숫자/영문)
         self._autocheck_on = True  # 저장 시 마킹검사 여부(재빌드에도 유지)
         self._digits_only = False  # 숫자 포함(치수성) 항목만 검사
+        self._fixed_dir_on = False  # 열기/저장 폴더 고정 사용 여부
+        self._fixed_dir = ""        # 고정 폴더 경로
+        self._last_dir = ""         # 마지막으로 열거나 저장한 폴더
         self._security_on = False  # 보안(오프라인) 모드
         self._security_warn = False  # True=경고만, False=강제종료
         self._sec_seen = 0  # 경고 모드에서 표시한 위반 수
         self._width_updating = False
+        self._erase_hold_prev = None  # X 키로 임시 지우개 중일 때 직전 도구
         self._nav_unmarked: list = []  # 미마킹 네비게이션 목록(현재 페이지)
         self._nav_idx = -1
+        self._paste_text = ""  # Ctrl+V로 집어든 클립보드 텍스트(다음 클릭에 찍음)
+        self._text_angle = 0.0  # 텍스트 회전 각도(PageUp/Down으로 조절, 시계방향 +)
+        self._automark_session: set = set()  # 현재 드래그에서 이미 칠한 박스(중복방지)
         self.canvas.autoMarkRequested.connect(self._on_automark)
+        self.canvas.autoMarkStarted.connect(lambda: self._automark_session.clear())
+        self.canvas.textRequested.connect(self._on_text_request)
 
         self._build_actions()
         self._build_toolbar()
         self._build_statusbar()
 
         self.canvas.viewChanged.connect(self._update_status)
+        self.canvas.viewChanged.connect(self._sync_scrollbars)
         self.canvas.undoStateChanged.connect(self._update_undo_actions)
         self.canvas.layersChanged.connect(self._refresh_layer_combo)
         self.canvas.layersChanged.connect(self._update_progress)
@@ -479,11 +634,16 @@ class MainWindow(QMainWindow):
         s.setValue("ocr/device", get_device())
         s.setValue("ocr/autocheck", self._autocheck_on)
         s.setValue("ocr/digits_only", self._digits_only)
+        s.setValue("dir/fixed_on", self._fixed_dir_on)
+        s.setValue("dir/fixed_path", self._fixed_dir)
+        s.setValue("dir/last", self._last_dir)
         s.setValue("security/offline", self._security_on)
         s.setValue("security/warn", self._security_warn)
         s.setValue("tool/eraser_mode", t.eraser_mode)
         s.setValue("tool/width_mode", t.width_mode)
         s.setValue("tool/hl_opacity", t.highlighter_opacity)
+        s.setValue("tool/automark_grow", t.automark_grow)
+        s.setValue("tool/automark_box", t.automark_box)
         s.setValue("color/pen", t.pen_color.name())
         s.setValue("color/hl", t.highlighter_color.name())
         for tool, widths in t.widths.items():
@@ -503,6 +663,17 @@ class MainWindow(QMainWindow):
             t.highlighter_color = QColor(hl)
             self.hl_color_btn.setStyleSheet(_color_button_style(t.highlighter_color))
         t.highlighter_opacity = float(s.value("tool/hl_opacity", t.highlighter_opacity))
+        # 자동마킹 두께(글자 팽창 px)
+        try:
+            grow = int(s.value("tool/automark_grow", t.automark_grow))
+            t.automark_grow = max(0, min(8, grow))
+            for v, act in self._cov_actions.items():
+                act.setChecked(v == t.automark_grow)
+        except (TypeError, ValueError):
+            pass
+        t.automark_box = s.value("tool/automark_box", t.automark_box, type=bool)
+        for b, act in self._fill_actions.items():
+            act.setChecked(b == t.automark_box)
         # 굵기(도구·단위별)
         for tool, widths in t.widths.items():
             for unit in list(widths):
@@ -539,10 +710,18 @@ class MainWindow(QMainWindow):
         ac = s.value("ocr/autocheck", True, type=bool)
         self._autocheck_on = ac
         self.act_autocheck.setChecked(ac)
-        # 숫자·치수만 검사
-        do = s.value("ocr/digits_only", False, type=bool)
+        # 숫자·치수만 검사 — 최초 실행(저장값 없음)엔 기본 ON, 이후엔 저장값 유지
+        do = s.value("ocr/digits_only", True, type=bool)
         self._digits_only = do
         self.act_digits_only.setChecked(do)
+        # 폴더(고정/마지막)
+        self._fixed_dir = s.value("dir/fixed_path", "") or ""
+        self._last_dir = s.value("dir/last", "") or ""
+        self._fixed_dir_on = s.value("dir/fixed_on", False, type=bool)
+        self.act_fixed_dir.blockSignals(True)
+        self.act_fixed_dir.setChecked(self._fixed_dir_on and bool(self._fixed_dir))
+        self.act_fixed_dir.blockSignals(False)
+        self._update_dir_info()
         # 보안 모드
         self._security_on = s.value("security/offline", False, type=bool)
         self._security_warn = s.value("security/warn", False, type=bool)
@@ -551,6 +730,52 @@ class MainWindow(QMainWindow):
         lang = s.value("ui/lang", current_ui_lang())
         if lang in ("ko", "en") and lang != current_ui_lang():
             self._set_ui_lang(lang)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        # X 누르고 있는 동안만 임시 지우개(떼면 이전 도구 복귀)
+        if (key == Qt.Key.Key_X and not event.isAutoRepeat()
+                and self._erase_hold_prev is None
+                and self.canvas.tools.tool != TOOL_ERASER):
+            self._erase_hold_prev = self.canvas.tools.tool
+            self._select_tool(TOOL_ERASER)
+            self.status.showMessage(
+                tr("지우개(누르는 동안) — X를 떼면 원래 도구로",
+                   "Eraser while held — release X to revert"), 2000)
+            return
+        if key == Qt.Key.Key_Escape and self._paste_text:
+            self._paste_text = ""  # 붙여넣기 대기 취소
+            self.canvas.clear_text_preview()
+            self.status.showMessage(tr("붙여넣기 취소", "Paste canceled"), 2000)
+            return
+        # 텍스트 도구일 때 PageUp=시계방향, PageDown=반시계방향 회전(90°씩)
+        if (self.canvas.tools.tool == TOOL_TEXT
+                and key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown)):
+            self._text_angle += 90.0 if key == Qt.Key.Key_PageUp else -90.0
+            self._text_angle = (self._text_angle + 180) % 360 - 180  # -180~180 정규화
+            self.canvas.set_text_preview_angle(self._text_angle)
+            self.status.showMessage(
+                tr("텍스트 회전: ", "Text rotation: ") + f"{self._text_angle:.0f}°", 3000)
+            return
+        # 방향키로 화면 이동(팬). Ctrl 동반 시 더 크게.
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+            if self.canvas.doc is not None:
+                step = 250 if event.modifiers() & Qt.KeyboardModifier.ControlModifier else 80
+                dx = step if key == Qt.Key.Key_Left else -step if key == Qt.Key.Key_Right else 0
+                dy = step if key == Qt.Key.Key_Up else -step if key == Qt.Key.Key_Down else 0
+                self.canvas.pan_by(dx, dy)
+                return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        # X를 떼면 임시 지우개 해제 → 직전 도구로 복귀
+        if (event.key() == Qt.Key.Key_X and not event.isAutoRepeat()
+                and self._erase_hold_prev is not None):
+            prev = self._erase_hold_prev
+            self._erase_hold_prev = None
+            self._select_tool(prev)
+            return
+        super().keyReleaseEvent(event)
 
     def closeEvent(self, event):
         self._save_settings()
@@ -593,6 +818,7 @@ class MainWindow(QMainWindow):
                 return
             doc = Document(pages, path)
             self._project_path = None
+        self._remember(path)
         self._ocr_cache.clear()
         self._nav_unmarked = []
         self._nav_idx = -1
@@ -600,8 +826,48 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         self._update_status()
 
+    def new_blank(self, width: int | None = None, height: int | None = None):
+        """그림판처럼 낙서할 수 있는 하얀 바탕 캔버스를 새로 연다.
+
+        크기를 지정하지 않으면 화면(작업영역) 크기로 만들어, 창을 키우면
+        하얀 배경이 화면을 가득 채운다.
+        """
+        # 캔버스 표시 영역(뷰포트) 크기에 맞춤 → 1:1로 띄우면 흰 바탕이 작업영역을
+        # 회색 여백 없이 가득 채운다. 아직 레이아웃 전이면 화면 크기로 대체.
+        vw, vh = self.canvas.width(), self.canvas.height()
+        if width is None and vw > 100:
+            width = vw
+        if height is None and vh > 100:
+            height = vh
+        if width is None or height is None:
+            scr = QGuiApplication.primaryScreen().availableGeometry()
+            width = width or scr.width()
+            height = height or scr.height()
+        img = QImage(int(width), int(height), QImage.Format.Format_RGBA8888)
+        img.fill(Qt.GlobalColor.white)
+        doc = Document([img])
+        self._project_path = None
+        self._ocr_cache.clear()
+        self._nav_unmarked = []
+        self._nav_idx = -1
+        self.canvas.set_document(doc)
+        # 화면맞춤(축소) 대신 1:1·좌상단 정렬 → 작업영역을 가득 채움
+        self.canvas.scale = 1.0
+        self.canvas.offset = QPointF(0, 0)
+        self.canvas.update()
+        self.canvas.viewChanged.emit()
+        self.setWindowTitle(f"{APP_TITLE} — {tr('새 캔버스', 'New canvas')}")
+        self._update_status()
+
     # ---------- 액션/메뉴 ----------
     def _build_actions(self):
+        self.act_new_blank = QAction(tr("새 캔버스(흰 바탕)", "New canvas (blank)"), self)
+        self.act_new_blank.setShortcut(QKeySequence.StandardKey.New)  # Ctrl+N
+        self.act_new_blank.setToolTip(
+            tr("그림판처럼 낙서할 흰 바탕 캔버스 (Ctrl+N)",
+               "Blank white canvas to doodle on (Ctrl+N)"))
+        self.act_new_blank.triggered.connect(lambda: self.new_blank())
+
         self.act_open = QAction(_make_action_icon("open_image"), tr("이미지 열기", "Open Image"), self)
         self.act_open.setIconText(tr("이미지", "Image"))
         self.act_open.setShortcut(QKeySequence.StandardKey.Open)
@@ -639,6 +905,27 @@ class MainWindow(QMainWindow):
         self.act_export_pdf = QAction(tr("PDF 내보내기(레이어 토글)", "Export PDF (toggle layers)"), self)
         self.act_export_pdf.triggered.connect(self.export_pdf_doc)
 
+        self.act_fixed_dir = QAction(
+            tr("항상 같은 폴더에서 열고 저장", "Always open/save in the same folder"), self)
+        self.act_fixed_dir.setCheckable(True)
+        self.act_fixed_dir.setChecked(self._fixed_dir_on)
+        self.act_fixed_dir.setToolTip(
+            tr("체크하면 아래에서 지정한 한 폴더에서만 열고 저장합니다.\n"
+               "체크를 풀면 마지막으로 열거나 저장한 폴더를 기억합니다.",
+               "When checked, always open/save in the one folder set below.\n"
+               "When unchecked, remember the folder you last used."))
+        self.act_fixed_dir.toggled.connect(self._on_toggle_fixed_dir)
+
+        self.act_choose_dir = QAction(tr("사용할 폴더 선택…", "Choose that folder…"), self)
+        self.act_choose_dir.setToolTip(
+            tr("'항상 같은 폴더' 사용 시 열고 저장할 폴더를 고릅니다.",
+               "Pick the folder used when 'always same folder' is on."))
+        self.act_choose_dir.triggered.connect(self._choose_fixed_dir)
+
+        # 현재 동작을 보여주는 안내(비활성, 클릭 불가) — 토글/선택 시 갱신
+        self.act_dir_info = QAction("", self)
+        self.act_dir_info.setEnabled(False)
+
         self.act_exit = QAction(tr("종료", "Exit"), self)
         self.act_exit.setShortcut("Ctrl+Q")
         self.act_exit.setToolTip(tr("프로그램 종료 (Ctrl+Q)", "Quit the program (Ctrl+Q)"))
@@ -653,6 +940,13 @@ class MainWindow(QMainWindow):
         self.act_redo.setShortcut(QKeySequence.StandardKey.Redo)
         self.act_redo.setToolTip(tr("다시실행 (Ctrl+Y)", "Redo (Ctrl+Y)"))
         self.act_redo.triggered.connect(self.canvas.redo)
+
+        self.act_paste_text = QAction(tr("텍스트 붙여넣기", "Paste text"), self)
+        self.act_paste_text.setShortcut(QKeySequence.StandardKey.Paste)  # Ctrl+V
+        self.act_paste_text.setToolTip(
+            tr("클립보드 텍스트를 집어 든 뒤 캔버스를 클릭한 위치에 찍습니다 (Ctrl+V)",
+               "Grab clipboard text, then click the canvas to place it (Ctrl+V)"))
+        self.act_paste_text.triggered.connect(self._paste_text_from_clipboard)
 
         self.act_fit = QAction(_make_action_icon("fit"), tr("화면맞춤", "Fit"), self)
         self.act_fit.setShortcut("Ctrl+0")
@@ -686,6 +980,8 @@ class MainWindow(QMainWindow):
 
         menu = self.menuBar()
         file_menu = menu.addMenu(tr("파일", "File"))
+        file_menu.addAction(self.act_new_blank)
+        file_menu.addSeparator()
         file_menu.addAction(self.act_open)
         file_menu.addAction(self.act_open_project)
         file_menu.addSeparator()
@@ -698,10 +994,19 @@ class MainWindow(QMainWindow):
         export_menu.addAction(self.act_export_pdf)
         export_menu.addAction(self.act_export_ora)
         file_menu.addSeparator()
+        loc_menu = file_menu.addMenu(tr("열기/저장 위치", "Open/Save location"))
+        loc_menu.addAction(self.act_fixed_dir)
+        loc_menu.addAction(self.act_choose_dir)
+        loc_menu.addSeparator()
+        loc_menu.addAction(self.act_dir_info)
+        self._update_dir_info()
+        file_menu.addSeparator()
         file_menu.addAction(self.act_exit)
         edit_menu = menu.addMenu(tr("편집", "Edit"))
         edit_menu.addAction(self.act_undo)
         edit_menu.addAction(self.act_redo)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.act_paste_text)
         view_menu = menu.addMenu(tr("보기", "View"))
         view_menu.addAction(self.act_fit)
         check_menu = menu.addMenu(tr("검사", "Check"))
@@ -710,6 +1015,7 @@ class MainWindow(QMainWindow):
         check_menu.addAction(self.act_autocheck)
         check_menu.addAction(self.act_digits_only)
         engine_menu = check_menu.addMenu(tr("OCR 엔진", "OCR Engine"))
+        self._engine_menu = engine_menu
         self.engine_group = QActionGroup(self)
         self.engine_group.setExclusive(True)
         self._engine_actions: dict[str, QAction] = {}
@@ -727,6 +1033,7 @@ class MainWindow(QMainWindow):
 
         # 연산 장치 선택 (Drawing OCR 등 torch 엔진에 적용)
         device_menu = check_menu.addMenu(tr("연산 장치", "Compute Device"))
+        self._device_menu = device_menu
         self.device_group = QActionGroup(self)
         self.device_group.setExclusive(True)
         self._device_actions: dict[str, QAction] = {}
@@ -744,6 +1051,47 @@ class MainWindow(QMainWindow):
             self.device_group.addAction(act)
             device_menu.addAction(act)
             self._device_actions[key] = act
+
+        # OCR 엔진/연산 장치 선택은 화면에서 숨김(RapidOCR 고정 운용).
+        # 메뉴 객체·로직은 그대로 두고 표시만 끈다 → 필요 시 아래 두 줄만 제거.
+        self._engine_menu.menuAction().setVisible(False)
+        self._device_menu.menuAction().setVisible(False)
+
+        # 자동마킹 채우기 방식: 텍스트 박스 전체 / 글자 모양만
+        fill_menu = check_menu.addMenu(tr("자동마킹 채우기", "Auto-mark fill"))
+        self.fill_group = QActionGroup(self)
+        self.fill_group.setExclusive(True)
+        self._fill_actions: dict[bool, QAction] = {}
+        for is_box, label in (
+            (True, tr("텍스트 박스 전체", "Whole text box")),
+            (False, tr("글자 모양만", "Glyph shapes only")),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(is_box == self.canvas.tools.automark_box)
+            act.triggered.connect(lambda _c=False, b=is_box: self._set_automark_box(b))
+            self.fill_group.addAction(act)
+            fill_menu.addAction(act)
+            self._fill_actions[is_box] = act
+
+        # 자동마킹 두께 — '글자 모양만' 방식에서 글자를 얼마나 두껍게 칠할지
+        cov_menu = check_menu.addMenu(tr("자동마킹 두께", "Auto-mark thickness"))
+        self.cov_group = QActionGroup(self)
+        self.cov_group.setExclusive(True)
+        self._cov_actions: dict[int, QAction] = {}
+        cur_grow = self.canvas.tools.automark_grow
+        for val, label in (
+            (1, tr("얇게 (글자 그대로)", "Thin (glyphs only)")),
+            (2, tr("보통", "Normal")),
+            (4, tr("굵게", "Thick")),
+        ):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(val == cur_grow)
+            act.triggered.connect(lambda _c=False, v=val: self._set_automark_grow(v))
+            self.cov_group.addAction(act)
+            cov_menu.addAction(act)
+            self._cov_actions[val] = act
 
         # UI 언어
         lang_menu = menu.addMenu(tr("언어", "Language"))
@@ -779,6 +1127,11 @@ class MainWindow(QMainWindow):
         sec_menu.addAction(self.act_security_warn)
 
         help_menu = menu.addMenu(tr("도움말", "Help"))
+        self.act_help = QAction(tr("사용법 및 단축키", "How to use & shortcuts"), self)
+        self.act_help.setShortcut(QKeySequence.StandardKey.HelpContents)  # F1
+        self.act_help.triggered.connect(self.show_help)
+        help_menu.addAction(self.act_help)
+        help_menu.addSeparator()
         self.act_about = QAction(tr("프로그램 정보", "About"), self)
         self.act_about.triggered.connect(self.show_about)
         help_menu.addAction(self.act_about)
@@ -786,6 +1139,31 @@ class MainWindow(QMainWindow):
     def show_about(self):
         QMessageBox.about(self, tr("Drawing Checker 정보", "About Drawing Checker"),
                           about_html())
+
+    def show_help(self):
+        """사용법 및 단축키 안내를 스크롤 가능한 창으로 표시."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("사용법 및 단축키", "How to use & shortcuts"))
+        dlg.resize(560, 600)
+        layout = QVBoxLayout(dlg)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(help_html())
+        layout.addWidget(browser)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dlg)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+
+    def _scale_toolbar_font(self, bar: QToolBar, factor: float):
+        """툴바와 그 위젯들의 글자 크기를 factor 배로 키운다(행 높이도 함께 커짐)."""
+        f = bar.font()
+        if f.pointSizeF() > 0:
+            f.setPointSizeF(f.pointSizeF() * factor)
+        else:
+            f.setPixelSize(max(1, int(f.pixelSize() * factor)))
+        bar.setFont(f)
 
     def _build_toolbar(self):
         tb = QToolBar("도구")
@@ -829,6 +1207,7 @@ class MainWindow(QMainWindow):
         pb = QToolBar("layer-tool")
         pb.setMovable(False)
         self.addToolBar(pb)
+        self._scale_toolbar_font(pb, 1.15)  # 이 줄 전체를 약 15% 키움
 
         # 레이어 그룹 (지정 색상 바로 왼쪽)
         pb.addWidget(QLabel(tr(" 레이어 ", " Layer ")))
@@ -841,47 +1220,49 @@ class MainWindow(QMainWindow):
 
         self.layer_rename_btn = QPushButton("✎")
         self.layer_rename_btn.setToolTip(tr("활성 레이어 이름 변경", "Rename active layer"))
-        self.layer_rename_btn.setFixedWidth(35)
+        self.layer_rename_btn.setFixedWidth(40)
         self.layer_rename_btn.clicked.connect(self._rename_active_layer)
         pb.addWidget(self.layer_rename_btn)
 
         self.layer_delete_btn = QPushButton("✕")
         self.layer_delete_btn.setToolTip(tr("활성 레이어 삭제", "Delete active layer"))
-        self.layer_delete_btn.setFixedWidth(35)
+        self.layer_delete_btn.setFixedWidth(40)
         self.layer_delete_btn.clicked.connect(self._delete_active_layer)
         pb.addWidget(self.layer_delete_btn)
 
         self.layer_visible_btn = QPushButton("👁")
         self.layer_visible_btn.setCheckable(True)
         self.layer_visible_btn.setToolTip(tr("활성 레이어 표시/숨김", "Show/hide active layer"))
-        self.layer_visible_btn.setFixedWidth(35)
+        self.layer_visible_btn.setFixedWidth(40)
         self.layer_visible_btn.toggled.connect(self._on_visible_toggled)
         pb.addWidget(self.layer_visible_btn)
 
         self.layer_up_btn = QPushButton("▲")
-        self.layer_up_btn.setToolTip(tr("레이어 위로", "Move layer up"))
-        self.layer_up_btn.setFixedWidth(30)
-        self.layer_up_btn.clicked.connect(lambda: self._move_active_layer(+1))
+        self.layer_up_btn.setToolTip(tr("위 레이어 선택", "Select layer above"))
+        self.layer_up_btn.setFixedWidth(35)
+        self.layer_up_btn.clicked.connect(lambda: self._select_adjacent_layer(+1))
         pb.addWidget(self.layer_up_btn)
 
         self.layer_down_btn = QPushButton("▼")
-        self.layer_down_btn.setToolTip(tr("레이어 아래로", "Move layer down"))
-        self.layer_down_btn.setFixedWidth(30)
-        self.layer_down_btn.clicked.connect(lambda: self._move_active_layer(-1))
+        self.layer_down_btn.setToolTip(tr("아래 레이어 선택", "Select layer below"))
+        self.layer_down_btn.setFixedWidth(35)
+        self.layer_down_btn.clicked.connect(lambda: self._select_adjacent_layer(-1))
         pb.addWidget(self.layer_down_btn)
 
         # 레이어 오른쪽: 도구(작은 아이콘) + 펜색/형광색/굵기/지우개 방식
         pb.addSeparator()
-        pb.setIconSize(QSize(24, 24))
+        pb.setIconSize(QSize(28, 28))  # 도구 아이콘 24→28 (약 15%)
         pb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
         self.tool_actions: dict[str, QAction] = {}
         for tool, label, shortcut in (
-            (TOOL_PEN, tr("펜", "Pen"), "P"),
-            (TOOL_HIGHLIGHTER, tr("형광펜", "Highlighter"), "H"),
-            (TOOL_ERASER, tr("지우개", "Eraser"), "E"),
+            (TOOL_HAND, tr("이동", "Hand"), "Space"),
             (TOOL_AUTOMARK, tr("자동마킹", "Auto-mark"), "A"),
+            (TOOL_HIGHLIGHTER, tr("형광펜", "Highlighter"), "H"),
+            (TOOL_PEN, tr("펜", "Pen"), "P"),
+            (TOOL_TEXT, tr("텍스트", "Text"), "T"),
+            (TOOL_ERASER, tr("지우개", "Eraser"), "E"),
         ):
             icon = (_make_action_icon("automark") if tool == TOOL_AUTOMARK
                     else _make_tool_icon(tool))
@@ -948,13 +1329,14 @@ class MainWindow(QMainWindow):
         cb = QToolBar("color-opacity")
         cb.setMovable(False)
         self.addToolBar(cb)
+        self._scale_toolbar_font(cb, 1.15)  # 색상 줄도 약 15% 키움
         cb.addWidget(QLabel(tr(" 지정 색상 ", " Colors ")))
         cha = tr("차", "")
         for i, (name, hex_code) in enumerate(PRESET_COLORS):
             color = QColor(hex_code)
             swatch = QPushButton()
             swatch.setToolTip(f"{i + 1}{cha} ({hex_code})")
-            swatch.setFixedSize(33, 28)
+            swatch.setFixedSize(38, 32)
             swatch.setStyleSheet(_color_button_style(color))
             swatch.clicked.connect(lambda _checked=False, c=color: self._apply_preset(c))
             cb.addWidget(swatch)
@@ -1062,11 +1444,15 @@ class MainWindow(QMainWindow):
         self.canvas.page.active_layer.visible = checked
         self.canvas.notify_layers_changed()
 
-    def _move_active_layer(self, delta: int):
-        if self.canvas.page is None:
+    def _select_adjacent_layer(self, delta: int):
+        """활성(선택) 레이어를 위(+1)/아래(-1) 레이어로 전환한다."""
+        page = self.canvas.page
+        if page is None:
             return
-        if self.canvas.page.move_active(delta):
-            self.canvas.notify_layers_changed()
+        new_index = page.active_index + delta
+        if 0 <= new_index < len(page.layers):
+            page.active_index = new_index
+            self.canvas.notify_layers_changed()  # 캔버스/컨트롤 동기화
 
     def _on_opacity_changed(self, value: int):
         if self._layer_controls_updating or self.canvas.page is None:
@@ -1126,6 +1512,10 @@ class MainWindow(QMainWindow):
         self.canvas.tools.tool = tool
         if tool in self.tool_actions:
             self.tool_actions[tool].setChecked(True)
+        if tool != TOOL_TEXT and self._paste_text:  # 다른 도구로 가면 붙여넣기 취소
+            self._paste_text = ""
+            self.canvas.clear_text_preview()
+        self.canvas.apply_tool_cursor()  # 손 도구면 손바닥 커서
         # 굵기 스핀을 도구별 값으로 동기화
         self._width_updating = True
         self.width_spin.setValue(self._current_tool_width())
@@ -1150,13 +1540,21 @@ class MainWindow(QMainWindow):
         self.canvas.tools.eraser_mode = self.eraser_mode_combo.currentData()
 
     def _set_custom_colors(self, hex_list):
-        """색상 선택창의 '사용자 지정 색' 슬롯을 왼쪽 위부터 채운다."""
-        for i, hex_code in enumerate(hex_list):
+        """색상 선택창의 '사용자 지정 색'을 윗줄부터 왼쪽→오른쪽 순으로 채운다.
+
+        Qt의 사용자 지정 색 격자는 2행×8열이고 내부 인덱스가 '열 우선'(인덱스가
+        아래로 증가)이라, 순서대로 0,1,2…를 넣으면 윗줄에 한 칸 건너 채워져
+        사람이 읽는 순서와 어긋난다. 윗줄 좌→우로 보이도록 인덱스를 재배치한다.
+        """
+        rows, cols = 2, 8
+        for pos, hex_code in enumerate(hex_list):
+            row, col = divmod(pos, cols)
+            idx = row + col * rows  # 열 우선 격자에서 윗줄 좌→우 = 0,2,4,…
             c = QColor(hex_code)
             try:
-                QColorDialog.setCustomColor(i, c)
+                QColorDialog.setCustomColor(idx, c)
             except TypeError:
-                QColorDialog.setCustomColor(i, c.rgb())
+                QColorDialog.setCustomColor(idx, c.rgb())
 
     def _pick_pen_color(self):
         self._set_custom_colors(CUSTOM_PEN_COLORS)  # 볼펜색 4개(왼쪽 위부터)
@@ -1191,6 +1589,33 @@ class MainWindow(QMainWindow):
     def _update_undo_actions(self):
         self.act_undo.setEnabled(self.canvas.can_undo())
         self.act_redo.setEnabled(self.canvas.can_redo())
+
+    def _sync_scrollbars(self):
+        """캔버스 뷰 상태(줌/팬/크기)에 맞춰 스크롤바 범위·위치를 갱신."""
+        m = self.canvas.scroll_metrics()
+        self._scroll_sync = True
+        if m is None:
+            self.hbar.setRange(0, 0)
+            self.vbar.setRange(0, 0)
+        else:
+            hmax, hpage, hval, vmax, vpage, vval = m
+            self.hbar.setRange(0, hmax)
+            self.hbar.setPageStep(hpage)
+            self.hbar.setValue(hval)
+            self.hbar.setEnabled(hmax > 0)
+            self.vbar.setRange(0, vmax)
+            self.vbar.setPageStep(vpage)
+            self.vbar.setValue(vval)
+            self.vbar.setEnabled(vmax > 0)
+        self._scroll_sync = False
+
+    def _on_hbar(self, value: int):
+        if not self._scroll_sync:
+            self.canvas.set_scroll(hval=value)
+
+    def _on_vbar(self, value: int):
+        if not self._scroll_sync:
+            self.canvas.set_scroll(vval=value)
 
     def _update_status(self):
         doc = self.canvas.doc
@@ -1229,12 +1654,74 @@ class MainWindow(QMainWindow):
             f"마킹 {marked}/{total} ({pct}%) · 남음 {unmarked}",
             f"Marked {marked}/{total} ({pct}%) · left {unmarked}"))
 
+    # ---------- 폴더(열기/저장 위치) ----------
+    def _dialog_dir(self) -> str:
+        """대화상자 시작 폴더: 고정 모드면 고정 폴더, 아니면 마지막 위치."""
+        if self._fixed_dir_on and self._fixed_dir and os.path.isdir(self._fixed_dir):
+            return self._fixed_dir
+        return self._last_dir if os.path.isdir(self._last_dir or "") else ""
+
+    def _save_start(self, default_name: str) -> str:
+        d = self._dialog_dir()
+        return os.path.join(d, default_name) if d else default_name
+
+    def _remember(self, path: str):
+        """마지막 사용 폴더 기억(고정 모드가 아닐 때 다음 대화상자에 반영)."""
+        d = os.path.dirname(path)
+        if d:
+            self._last_dir = d
+            self._update_dir_info()
+
+    def _update_dir_info(self):
+        """'열기/저장 위치' 하단 안내 문구를 현재 상태에 맞게 갱신."""
+        if not hasattr(self, "act_dir_info"):
+            return
+        if self._fixed_dir_on and self._fixed_dir:
+            txt = tr("● 지금: 항상 이 폴더 → ", "● Now: always this folder → ") + self._fixed_dir
+        elif self._last_dir:
+            txt = tr("● 지금: 마지막 사용 폴더 기억 → ",
+                     "● Now: remembering last folder → ") + self._last_dir
+        else:
+            txt = tr("● 지금: 마지막 사용 폴더를 기억합니다",
+                     "● Now: remembering the last folder used")
+        self.act_dir_info.setText(txt)
+
+    def _choose_fixed_dir(self) -> bool:
+        start = self._fixed_dir or self._last_dir or ""
+        d = QFileDialog.getExistingDirectory(
+            self, tr("열고 저장할 폴더 선택", "Choose the folder to open/save in"), start)
+        if d:
+            self._fixed_dir = d
+            self._update_dir_info()
+            return True
+        return False
+
+    def _on_toggle_fixed_dir(self, checked: bool):
+        if checked and not (self._fixed_dir and os.path.isdir(self._fixed_dir)):
+            # 켰는데 지정 폴더가 없으면 선택받기, 취소하면 다시 끔
+            if not self._choose_fixed_dir():
+                self.act_fixed_dir.blockSignals(True)
+                self.act_fixed_dir.setChecked(False)
+                self.act_fixed_dir.blockSignals(False)
+                return
+        self._fixed_dir_on = checked
+        self._update_dir_info()
+        if checked:
+            self.status.showMessage(
+                tr("이제 항상 이 폴더에서 열고 저장합니다: ",
+                   "Now always opening/saving in: ") + self._fixed_dir, 4000)
+        else:
+            self.status.showMessage(
+                tr("폴더 고정 해제 — 마지막 사용 폴더를 기억합니다",
+                   "Off — will remember the last folder used"), 4000)
+
     # ---------- 파일 ----------
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, tr("이미지 열기", "Open Image"), "", open_filter())
+            self, tr("이미지 열기", "Open Image"), self._dialog_dir(), open_filter())
         if not path:
             return
+        self._remember(path)
         try:
             pages = load_pages(path)
         except Exception as exc:  # noqa: BLE001
@@ -1252,14 +1739,17 @@ class MainWindow(QMainWindow):
 
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "프로젝트 열기", "", "DCK 프로젝트 (*.dck)"
+            self, tr("프로젝트 열기", "Open Project"), self._dialog_dir(),
+            "DCK (*.dck)"
         )
         if not path:
             return
+        self._remember(path)
         try:
             doc = load_dck(path)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "열기 실패", f"프로젝트를 열 수 없습니다:\n{exc}")
+            QMessageBox.critical(self, tr("열기 실패", "Open failed"),
+                                 tr("프로젝트를 열 수 없습니다:\n", "Cannot open project:\n") + str(exc))
             return
         self._project_path = path
         self._ocr_cache.clear()
@@ -1282,12 +1772,14 @@ class MainWindow(QMainWindow):
             if src:
                 default = os.path.splitext(os.path.basename(src))[0] + ".dck"
             path, _ = QFileDialog.getSaveFileName(
-                self, "프로젝트 저장", default, "DCK 프로젝트 (*.dck)"
+                self, tr("프로젝트 저장", "Save Project"), self._save_start(default),
+                "DCK (*.dck)"
             )
             if not path:
                 return
             if not path.lower().endswith(".dck"):
                 path += ".dck"
+        self._remember(path)
         try:
             written = save_bundle(self.canvas.doc, path)  # .dck + .ora 함께 저장
         except Exception as exc:  # noqa: BLE001
@@ -1314,10 +1806,11 @@ class MainWindow(QMainWindow):
             suffix = f"_p{doc.current_index + 1}" if doc.page_count > 1 else ""
             default = f"{stem}{suffix}.ora"
         path, _ = QFileDialog.getSaveFileName(
-            self, "OpenRaster로 내보내기", default, "OpenRaster (*.ora)"
+            self, "OpenRaster", self._save_start(default), "OpenRaster (*.ora)"
         )
         if not path:
             return
+        self._remember(path)
         if not path.lower().endswith(".ora"):
             path += ".ora"
         try:
@@ -1359,10 +1852,11 @@ class MainWindow(QMainWindow):
             suffix = "" if all_pages else f"_p{doc.current_index + 1}"
             default = f"{stem}{suffix}_marked.tif"
         path, _ = QFileDialog.getSaveFileName(
-            self, "TIFF로 내보내기", default, "TIFF 이미지 (*.tif *.tiff)"
+            self, "TIFF", self._save_start(default), "TIFF (*.tif *.tiff)"
         )
         if not path:
             return
+        self._remember(path)
         if not path.lower().endswith((".tif", ".tiff")):
             path += ".tif"
         try:
@@ -1383,10 +1877,11 @@ class MainWindow(QMainWindow):
         if doc.path:
             default = os.path.splitext(os.path.basename(doc.path))[0] + "_layers.pdf"
         path, _ = QFileDialog.getSaveFileName(
-            self, "PDF로 내보내기(레이어 토글)", default, "PDF 문서 (*.pdf)"
+            self, "PDF", self._save_start(default), "PDF (*.pdf)"
         )
         if not path:
             return
+        self._remember(path)
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
         try:
@@ -1660,6 +2155,62 @@ class MainWindow(QMainWindow):
                     hit += 1
         return total > 0 and hit / total >= ratio
 
+    def _set_automark_box(self, is_box: bool):
+        self.canvas.tools.automark_box = bool(is_box)
+        self.status.showMessage(
+            tr("자동마킹 채우기: ", "Auto-mark fill: ")
+            + (tr("텍스트 박스 전체", "whole text box") if is_box
+               else tr("글자 모양만", "glyph shapes only")), 3000)
+
+    def _set_automark_grow(self, value: int):
+        self.canvas.tools.automark_grow = int(value)
+        self.status.showMessage(
+            tr("자동마킹 두께(글자 팽창): ", "Auto-mark thickness (glyph grow): ")
+            + f"{value}px", 3000)
+
+    def _paste_text_from_clipboard(self):
+        """Ctrl+V: 클립보드 텍스트를 집어 들고, 다음에 클릭한 위치에 바로 찍는다."""
+        text = QGuiApplication.clipboard().text()
+        if not text.strip():
+            self.status.showMessage(
+                tr("클립보드에 텍스트가 없습니다.", "No text in clipboard."), 3000)
+            return
+        self._paste_text = text
+        self._select_tool(TOOL_TEXT)  # 텍스트 도구로 전환
+        self.canvas.set_text_preview(text, self._text_angle)  # 커서를 따라다니는 미리보기
+        self.status.showMessage(
+            tr("붙여넣기: 커서를 따라옵니다 — 클릭해 배치 / PageUp·Down 회전 / Esc 취소",
+               "Paste: follows cursor — click to place / PageUp·Down rotate / Esc cancel"),
+            8000)
+
+    def _on_text_request(self, img_pt: QPointF):
+        """텍스트 도구: 클릭 위치에 글자를 그린다(펜 색·현재 글자크기).
+
+        Ctrl+V로 집어든 클립보드 텍스트가 있으면 입력창 없이 바로 찍는다.
+        """
+        page = self.canvas.page
+        if page is None:
+            return
+        if not page.active_layer.visible:
+            QMessageBox.information(
+                self, tr("텍스트", "Text"),
+                tr("숨긴 레이어에는 입력할 수 없습니다.", "Cannot type on a hidden layer."))
+            return
+        if self._paste_text:  # 붙여넣기 대기 중 → 입력창 생략하고 바로 찍기
+            text = self._paste_text
+            self._paste_text = ""
+            self.canvas.clear_text_preview()
+            if self.canvas.add_text(img_pt, text, self._text_angle):
+                self._update_undo_actions()
+                self.status.showMessage(tr("붙여넣기 완료", "Pasted"), 2000)
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, tr("텍스트 입력", "Enter text"),
+            tr("내용(여러 줄 가능):", "Text (multi-line allowed):"), "")
+        if ok and text.strip():
+            self.canvas.add_text(img_pt, text, self._text_angle)
+            self._update_undo_actions()
+
     def _on_automark(self, img_pt: QPointF):
         """자동마킹 도구: 클릭 위치의 검출 박스를 형광펜으로 채운다."""
         page = self.canvas.page
@@ -1680,9 +2231,24 @@ class MainWindow(QMainWindow):
         if not cands:
             return
         it = min(cands, key=lambda b: b.rect.width() * b.rect.height())
-        if self._box_already_marked(page.active_layer, it.rect):
-            return  # 이미 칠해진 박스는 건너뜀(중복 방지)
-        self.canvas.mark_box_highlight(it.rect)
+        # 한 번의 드래그 안에서 같은 박스를 반복 칠하지 않도록만 막는다.
+        # (별도 클릭이면 세션이 비므로 기존 형광펜/마킹 위에 덧칠 가능)
+        r = it.rect
+        rkey = (r.left(), r.top(), r.width(), r.height())
+        if rkey in self._automark_session:
+            return
+        self._automark_session.add(rkey)
+        # 이미 마킹된 박스면: 기존 색을 남기고 '절반'에만 겹쳐 칠한다.
+        # 가로 문자(가로로 긴 박스)는 아래 절반, 세로 문자(세로로 긴 박스)는
+        # 오른쪽 절반에 칠해 → 글자 방향과 나란한 두 줄로 보인다.
+        target = r
+        if self._box_already_marked(page.active_layer, r):
+            w, h = r.width(), r.height()
+            if h > w:  # 세로 문자 → 좌우 반반(오른쪽 절반)
+                target = QRect(r.left() + w // 2, r.top(), w - w // 2, h)
+            else:      # 가로 문자 → 위아래 반반(아래 절반)
+                target = QRect(r.left(), r.top() + h // 2, w, h - h // 2)
+        self.canvas.mark_box_highlight(target)
         self._update_undo_actions()
 
     def _confirm_before_save(self) -> bool:
@@ -1736,10 +2302,11 @@ class MainWindow(QMainWindow):
             suffix = f"_p{doc.current_index + 1}" if doc.page_count > 1 else ""
             default = f"{stem}{suffix}_marked.png"
         path, _ = QFileDialog.getSaveFileName(
-            self, "PNG로 내보내기", default, "PNG 이미지 (*.png)"
+            self, "PNG", self._save_start(default), "PNG (*.png)"
         )
         if not path:
             return
+        self._remember(path)
         if flat.save(path, "PNG"):
             self.status.showMessage(f"저장됨: {path}", 4000)
         else:

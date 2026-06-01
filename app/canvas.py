@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPoint, QPointF, QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QImage,
     QMouseEvent,
     QPainter,
@@ -18,16 +19,20 @@ from .layer import (
     Document,
     Page,
     Stroke,
+    build_automark_stroke,
     composition_mode,
     new_transparent_image,
     paint_stroke,
     stroke_hit,
 )
+from .layer import STROKE_TEXT
 
 TOOL_PEN = "pen"
 TOOL_HIGHLIGHTER = "highlighter"
 TOOL_ERASER = "eraser"
 TOOL_AUTOMARK = "automark"  # 검출된 치수 박스를 클릭/드래그로 자동 형광 마킹
+TOOL_TEXT = "text"          # 클릭 위치에 텍스트(글자) 입력
+TOOL_HAND = "hand"          # 손바닥 도구: 좌클릭 드래그로 화면 이동(팬)
 
 ERASE_MODE_STROKE = "stroke"  # 획 전체 지우기
 ERASE_MODE_PIXEL = "pixel"    # 부분(픽셀) 지우기
@@ -47,6 +52,8 @@ def _default_widths() -> dict:
         TOOL_HIGHLIGHTER: {WIDTH_PX: 18.0, WIDTH_PCT: 1.50},
         TOOL_ERASER: {WIDTH_PX: 24.0, WIDTH_PCT: 2.00},
         TOOL_AUTOMARK: {WIDTH_PX: 1.0, WIDTH_PCT: 0.10},  # 미사용(스핀 호환용)
+        TOOL_HAND: {WIDTH_PX: 1.0, WIDTH_PCT: 0.10},      # 미사용(스핀 호환용)
+        TOOL_TEXT: {WIDTH_PX: 24.0, WIDTH_PCT: 2.00},     # 글자 크기(픽셀/이미지%)
     }
 
 
@@ -59,6 +66,8 @@ class ToolSettings:
     eraser_mode: str = ERASE_MODE_STROKE
     width_mode: str = WIDTH_PCT  # 굵기 단위 기본값: 이미지 폭 %
     widths: dict = field(default_factory=_default_widths)
+    automark_grow: int = 2  # 자동마킹(글자 모양만): 글자 마스크 팽창 px
+    automark_box: bool = True  # 자동마킹 채우기: True=텍스트 박스 전체, False=글자 모양만
 
     def __post_init__(self):
         if self.pen_color is None:
@@ -97,6 +106,8 @@ class Canvas(QWidget):
     viewChanged = Signal()         # 줌/페이지 변경 → 상태바 갱신
     undoStateChanged = Signal()    # 실행취소 가능 여부 변경
     autoMarkRequested = Signal(QPointF)  # 자동마킹 도구 클릭/드래그 위치(이미지 좌표)
+    autoMarkStarted = Signal()           # 자동마킹 한 번의 드래그 시작(중복방지 세션 초기화)
+    textRequested = Signal(QPointF)      # 텍스트 도구 클릭 위치(이미지 좌표)
     contentChanged = Signal()      # 활성 레이어 그림 변경(마킹 진척도 갱신용)
 
     def __init__(self, parent=None):
@@ -117,6 +128,15 @@ class Canvas(QWidget):
 
         # 마킹검사: 미마킹 텍스트 박스 오버레이(현재 페이지, 이미지 좌표)
         self._overlay_rects: list = []
+
+        # 텍스트 붙여넣기 미리보기(커서를 따라다니는 반투명 글자)
+        self._text_preview = ""
+        self._preview_img_pt: QPointF | None = None
+        self._preview_angle = 0.0  # 미리보기 회전 각도(도, 시계방향 +)
+
+        # 캔버스 크기 조절(그림판식): 모서리/가장자리 핸들 드래그
+        self._resizing: str | None = None       # 'e' | 's' | 'se'
+        self._resize_size: tuple | None = None   # 드래그 중 미리보기 크기 (w, h)
 
         # 그리는 중 상태
         self._drawing = False
@@ -213,6 +233,60 @@ class Canvas(QWidget):
         return QPointF((pt.x() - self.offset.x()) / self.scale,
                        (pt.y() - self.offset.y()) / self.scale)
 
+    def image_to_view(self, x: float, y: float) -> QPointF:
+        return QPointF(self.offset.x() + x * self.scale,
+                       self.offset.y() + y * self.scale)
+
+    # ---------- 캔버스 크기 조절 핸들 ----------
+    _HANDLE = 5  # 핸들 반쪽 크기(px)
+    _HANDLE_TOL = 9  # 클릭 허용 반경(px)
+    MIN_CANVAS = 16  # 최소 캔버스 크기
+
+    def _resize_handles(self) -> dict:
+        """오른쪽(e)·아래(s)·우하단 모서리(se) 핸들의 뷰 좌표."""
+        if self.page is None:
+            return {}
+        w, h = self.page.size.width(), self.page.size.height()
+        return {
+            "se": self.image_to_view(w, h),
+            "e": self.image_to_view(w, h / 2),
+            "s": self.image_to_view(w / 2, h),
+        }
+
+    def _handle_at(self, view_pt: QPointF) -> str | None:
+        tol = self._HANDLE_TOL
+        for key, h in self._resize_handles().items():  # se 먼저(모서리 우선)
+            if abs(view_pt.x() - h.x()) <= tol and abs(view_pt.y() - h.y()) <= tol:
+                return key
+        return None
+
+    def _update_resize(self, view_pt: QPointF):
+        img = self.view_to_image(view_pt)
+        w, h = self._resize_size
+        if self._resizing in ("e", "se"):
+            w = max(self.MIN_CANVAS, int(round(img.x())))
+        if self._resizing in ("s", "se"):
+            h = max(self.MIN_CANVAS, int(round(img.y())))
+        self._resize_size = (w, h)
+        self.update()
+
+    def _finish_resize(self):
+        size = self._resize_size
+        self._resizing = None
+        self._resize_size = None
+        page = self.page
+        if page is not None and size and (
+                size != (page.size.width(), page.size.height())):
+            page.resize_canvas(size[0], size[1])
+            self._undo.clear()        # 이전 크기 스냅샷은 무효
+            self._redo.clear()
+            self.undoStateChanged.emit()
+            self._rebuild_caches()
+            self.viewChanged.emit()   # 스크롤바/상태 갱신
+            self.contentChanged.emit()
+        self.update()
+        self.apply_tool_cursor()
+
     # ---------- 줌/팬 ----------
     def fit_to_window(self):
         page = self.page
@@ -240,6 +314,56 @@ class Canvas(QWidget):
                               anchor.y() - img_pt.y() * scale)
         self.update()
         self.viewChanged.emit()
+
+    def scroll_metrics(self):
+        """스크롤바 동기화용 (가로max, 가로페이지, 가로값, 세로max, 세로페이지, 세로값).
+
+        값은 뷰 픽셀 기준. 문서가 없으면 None.
+        """
+        if self.page is None:
+            return None
+        iw = self.page.size.width() * self.scale
+        ih = self.page.size.height() * self.scale
+        vw, vh = self.width(), self.height()
+        hmax, vmax = max(0, int(iw - vw)), max(0, int(ih - vh))
+        hval = int(min(hmax, max(0, -self.offset.x())))
+        vval = int(min(vmax, max(0, -self.offset.y())))
+        return (hmax, int(vw), hval, vmax, int(vh), vval)
+
+    def set_scroll(self, hval: int | None = None, vval: int | None = None):
+        """스크롤 위치를 뷰 픽셀 값으로 설정(범위 안으로 클램프). 이미지가 뷰보다
+        작은 축은 중앙 정렬을 유지한다."""
+        m = self.scroll_metrics()
+        if m is None:
+            return
+        hmax, _, hcur, vmax, _, vcur = m
+        h = hcur if hval is None else max(0, min(hmax, hval))
+        v = vcur if vval is None else max(0, min(vmax, vval))
+        if hmax > 0:
+            self.offset.setX(-float(h))
+        if vmax > 0:
+            self.offset.setY(-float(v))
+        self.update()
+        self.viewChanged.emit()
+
+    def pan_by(self, dx: float, dy: float):
+        """현재 위치에서 화면을 (dx, dy) 뷰 픽셀만큼 이동(방향키용, 범위 클램프)."""
+        m = self.scroll_metrics()
+        if m is None:
+            return
+        # dx>0 = 왼쪽 내용 보기(이미지 오른쪽으로). 스크롤값은 그 반대.
+        self.set_scroll(hval=m[2] - int(dx), vval=m[5] - int(dy))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.viewChanged.emit()  # 스크롤바 범위 재계산
+
+    def apply_tool_cursor(self):
+        """현재 도구에 맞는 커서를 적용(손 도구는 손바닥 모양)."""
+        if self.tools.tool == TOOL_HAND:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _center_image(self):
         page = self.page
@@ -289,7 +413,64 @@ class Canvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for r in self._overlay_rects:
                 painter.drawRect(r)
+
+        # 텍스트 붙여넣기 미리보기(이미지 좌표계 그대로 → 줌에 맞춰 크기 반영)
+        self._paint_text_preview(painter)
+
+        # 캔버스 크기 조절 핸들/미리보기(뷰 좌표 → 변환 초기화 후 그림)
+        painter.resetTransform()
+        if self._resizing and self._resize_size:
+            w, h = self._resize_size
+            tl = self.image_to_view(0, 0)
+            br = self.image_to_view(w, h)
+            pen = QPen(QColor(30, 120, 230), 1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRectF(tl, br))
+        for hp in self._resize_handles().values():
+            painter.setPen(QPen(QColor(40, 40, 40), 1))
+            painter.setBrush(QColor(255, 255, 255))
+            s = self._HANDLE
+            painter.drawRect(QRectF(hp.x() - s, hp.y() - s, 2 * s, 2 * s))
         painter.end()
+
+    def set_text_preview(self, text: str, angle: float = 0.0):
+        """붙여넣기 대기 텍스트를 커서 옆에 미리 보여준다('' 면 끔)."""
+        self._text_preview = text or ""
+        self._preview_angle = angle
+        self.update()
+
+    def set_text_preview_angle(self, angle: float):
+        if self._text_preview:
+            self._preview_angle = angle
+            self.update()
+
+    def clear_text_preview(self):
+        if self._text_preview:
+            self._text_preview = ""
+            self.update()
+
+    def _paint_text_preview(self, painter: QPainter):
+        """현재 커서 위치(이미지 좌표)에 반투명 글자 미리보기를 그린다(회전 반영)."""
+        if not self._text_preview or self._preview_img_pt is None:
+            return
+        font = QFont()
+        font.setPixelSize(max(4, int(round(self._px_width(TOOL_TEXT)))))
+        painter.setFont(font)
+        c = self.tools.pen_color
+        painter.setPen(QColor(c.red(), c.green(), c.blue(), 130))  # 반투명
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(font)
+        x, y = self._preview_img_pt.x(), self._preview_img_pt.y()
+        lh, asc = fm.height(), fm.ascent()
+        painter.save()
+        painter.translate(x, y)
+        if self._preview_angle:
+            painter.rotate(self._preview_angle)
+        for i, line in enumerate(self._text_preview.split("\n")):
+            painter.drawText(0, asc + i * lh, line)
+        painter.restore()
 
     def set_overlay_rects(self, rects: list):
         self._overlay_rects = list(rects)
@@ -310,18 +491,28 @@ class Canvas(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         if self.doc is None:
             return
-        if event.button() == Qt.MouseButton.MiddleButton or (
-            event.button() == Qt.MouseButton.LeftButton
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
+        left = event.button() == Qt.MouseButton.LeftButton
+        # 크기 조절 핸들 위에서 좌클릭(Ctrl 없이) → 캔버스 리사이즈 시작
+        if left and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            handle = self._handle_at(event.position())
+            if handle is not None:
+                self._resizing = handle
+                self._resize_size = (self.page.size.width(), self.page.size.height())
+                return
+        if (event.button() == Qt.MouseButton.MiddleButton
+                or (left and event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                or (left and self.tools.tool == TOOL_HAND)):
             self._panning = True
             self._pan_last = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if event.button() == Qt.MouseButton.LeftButton:
             img_pt = self.view_to_image(QPointF(event.position()))
-            if self.tools.tool == TOOL_AUTOMARK:
+            if self.tools.tool == TOOL_TEXT:
+                self.textRequested.emit(img_pt)  # 입력창은 외부(메인윈도우)에서
+            elif self.tools.tool == TOOL_AUTOMARK:
                 self._automarking = True
+                self.autoMarkStarted.emit()          # 새 드래그 시작 → 세션 초기화
                 self.autoMarkRequested.emit(img_pt)  # 박스 채우기는 외부(메인윈도우)에서
             elif (self.tools.tool == TOOL_ERASER
                     and self.tools.eraser_mode == ERASE_MODE_STROKE):
@@ -330,13 +521,30 @@ class Canvas(QWidget):
                 self._begin_stroke(img_pt)  # 펜/형광펜 또는 부분 지우기
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if self._resizing:
+            self._update_resize(event.position())
+            return
         if self._panning and self._pan_last is not None:
             now = event.position().toPoint()
             self.offset += QPointF(now - self._pan_last)
             self._pan_last = now
             self.update()
             return
+        # 유휴 상태: 크기 조절 핸들 위면 방향 커서 표시
+        if not (self._drawing or self._erasing or self._automarking):
+            hk = self._handle_at(event.position())
+            if hk is not None:
+                self.setCursor({
+                    "e": Qt.CursorShape.SizeHorCursor,
+                    "s": Qt.CursorShape.SizeVerCursor,
+                    "se": Qt.CursorShape.SizeFDiagCursor,
+                }[hk])
+            elif not self._text_preview:
+                self.apply_tool_cursor()
         img_pt = self.view_to_image(QPointF(event.position()))
+        if self._text_preview:  # 붙여넣기 미리보기를 커서 위치로 갱신
+            self._preview_img_pt = img_pt
+            self.update()
         if self._drawing:
             self._continue_stroke(img_pt)
         elif self._erasing:
@@ -344,11 +552,20 @@ class Canvas(QWidget):
         elif self._automarking:
             self.autoMarkRequested.emit(img_pt)
 
+    def leaveEvent(self, event):
+        if self._text_preview and self._preview_img_pt is not None:
+            self._preview_img_pt = None  # 캔버스 밖이면 미리보기 숨김
+            self.update()
+        super().leaveEvent(event)
+
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._resizing:
+            self._finish_resize()
+            return
         if self._panning:
             self._panning = False
             self._pan_last = None
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.apply_tool_cursor()
             return
         if self._drawing:
             self._end_stroke()
@@ -357,26 +574,75 @@ class Canvas(QWidget):
         elif self._automarking:
             self._automarking = False
 
-    # ---------- 자동 마킹 / 화면 이동 ----------
-    def mark_box_highlight(self, rect) -> bool:
-        """주어진 이미지 좌표 사각형을 활성 레이어에 형광펜으로 채운다."""
+    def add_text(self, img_pt: QPointF, text: str, angle: float = 0.0) -> bool:
+        """클릭 위치(좌상단 기준)에 텍스트를 활성 레이어에 그린다(angle: 시계방향 도)."""
         page = self.page
-        if page is None or not page.active_layer.visible:
+        if page is None or not page.active_layer.visible or not text.strip():
             return False
         self._push_undo()
         layer = page.active_layer
-        c = self.tools.highlighter_color
-        pad = 2
-        yc = rect.center().y()
-        pts = [(rect.left() - pad, yc), (rect.right() + pad, yc)]
-        width = rect.height() + pad * 2
+        c = self.tools.pen_color
         stroke = Stroke(
-            tool=TOOL_HIGHLIGHTER,
-            color=(c.red(), c.green(), c.blue(), c.alpha()),
-            width=float(width),
-            opacity=self.tools.highlighter_opacity,
-            points=pts,
+            tool=STROKE_TEXT,
+            color=(c.red(), c.green(), c.blue(), 255),
+            width=float(self._px_width(TOOL_TEXT)),
+            opacity=1.0,
+            points=[(img_pt.x(), img_pt.y())],
+            text=text,
+            angle=angle,
         )
+        layer.strokes.append(stroke)
+        paint_stroke(layer.image, stroke)
+        self.update()
+        self.contentChanged.emit()
+        return True
+
+    # ---------- 자동 마킹 / 화면 이동 ----------
+    def mark_box_highlight(self, rect) -> bool:
+        """검출된 OCR 박스를 활성 레이어에 형광펜으로 칠한다.
+
+        채우기 방식(self.tools.automark_box):
+          - True : 텍스트 바운더리(박스) 전체를 칠함
+          - False: 인식된 글자 모양만 따라 칠함(주변 여백/선 안 건드림)
+        """
+        page = self.page
+        if page is None or not page.active_layer.visible:
+            return False
+        c = self.tools.highlighter_color
+        if getattr(self.tools, "automark_box", True):
+            # 박스 전체: 굵은 형광펜 선으로 사각형을 채운다. 박스의 '긴 방향'으로
+            # 선을 긋고 '짧은 방향'을 선 두께로 써, 가로/세로 어떤 박스든 정확히
+            # 채워진다(형광펜 둥근 캡이 박스 끝에 딱 맞도록 끝점을 두께/2만큼 당김).
+            xc, yc = rect.center().x(), rect.center().y()
+            bw, bh = rect.width(), rect.height()
+            if bw >= bh:  # 가로로 긴(보통) 박스 → 수평선, 두께=높이
+                w = float(max(2, bh))
+                half = w / 2.0
+                a, b = rect.left() + half, rect.right() - half
+                pts = [(a, yc), (b, yc)] if b >= a else [(xc, yc)]
+            else:         # 세로로 긴 박스 → 수직선, 두께=너비
+                w = float(max(2, bw))
+                half = w / 2.0
+                a, b = rect.top() + half, rect.bottom() - half
+                pts = [(xc, a), (xc, b)] if b >= a else [(xc, yc)]
+            stroke = Stroke(
+                tool=TOOL_HIGHLIGHTER,
+                color=(c.red(), c.green(), c.blue(), c.alpha()),
+                width=w,
+                opacity=self.tools.highlighter_opacity,
+                points=pts,
+            )
+        else:
+            grow = int(getattr(self.tools, "automark_grow", 2))
+            stroke = build_automark_stroke(
+                page.base, rect,
+                (c.red(), c.green(), c.blue(), c.alpha()),
+                self.tools.highlighter_opacity, grow,
+            )
+        if stroke is None:
+            return False
+        self._push_undo()
+        layer = page.active_layer
         layer.strokes.append(stroke)
         paint_stroke(layer.image, stroke)
         self.update()
