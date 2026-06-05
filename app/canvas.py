@@ -183,13 +183,16 @@ class Canvas(QWidget):
             self._below = self._above = None
             return
         size = page.size
-        ai = page.active_index
+        # 현재 모드(그룹) 레이어만 합성 → 다른 모드 마킹은 완전히 숨김
+        cur = page.current_layers()
+        active = page.active_layer
+        ai = cur.index(active) if active in cur else len(cur)
 
         below = new_transparent_image(size)
         bp = QPainter(below)
         bp.fillRect(below.rect(), Qt.GlobalColor.white)
         bp.drawImage(0, 0, page.base)
-        for layer in page.layers[:ai]:
+        for layer in cur[:ai]:
             if not layer.visible:
                 continue
             bp.setOpacity(layer.opacity)
@@ -200,7 +203,7 @@ class Canvas(QWidget):
 
         above = new_transparent_image(size)
         ap = QPainter(above)
-        for layer in page.layers[ai + 1:]:
+        for layer in cur[ai + 1:]:
             if not layer.visible:
                 continue
             ap.setOpacity(layer.opacity)
@@ -574,8 +577,12 @@ class Canvas(QWidget):
         elif self._automarking:
             self._automarking = False
 
-    def add_text(self, img_pt: QPointF, text: str, angle: float = 0.0) -> bool:
-        """클릭 위치(좌상단 기준)에 텍스트를 활성 레이어에 그린다(angle: 시계방향 도)."""
+    def add_text(self, img_pt: QPointF, text: str, angle: float = 0.0,
+                 boxed: bool = False) -> bool:
+        """클릭 위치(좌상단 기준)에 텍스트를 활성 레이어에 그린다(angle: 시계방향 도).
+
+        boxed=True면 글자 둘레에 테두리 박스(스탬프/도장).
+        """
         page = self.page
         if page is None or not page.active_layer.visible or not text.strip():
             return False
@@ -590,6 +597,7 @@ class Canvas(QWidget):
             points=[(img_pt.x(), img_pt.y())],
             text=text,
             angle=angle,
+            boxed=boxed,
         )
         layer.strokes.append(stroke)
         paint_stroke(layer.image, stroke)

@@ -1,8 +1,10 @@
 """메인 윈도우: 툴바, 레이어 패널, 메뉴, 페이지 이동."""
 from __future__ import annotations
 
+import csv
 import os
 import time
+from datetime import datetime
 
 from PySide6.QtCore import (
     QEventLoop,
@@ -12,11 +14,13 @@ from PySide6.QtCore import (
     QRectF,
     QSettings,
     QSize,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
     Signal,
 )
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -31,6 +35,7 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -66,7 +71,7 @@ from .canvas import (
     Canvas,
 )
 from .image_loader import load_pages
-from .layer import BLEND_MULTIPLY, BLEND_NORMAL, Document
+from .layer import BLEND_MULTIPLY, BLEND_NORMAL, MODE_INSPECT, MODE_PROGRAM, Document
 from .ocr import (
     DEVICE_AUTO,
     DEVICE_CPU,
@@ -75,6 +80,7 @@ from .ocr import (
     default_engine,
     detect_text_boxes,
     engine_available,
+    filter_boxed_text,
     find_unmarked,
     get_device,
     list_engines,
@@ -88,6 +94,7 @@ from .project import (
     flatten_page,
     load_dck,
     save_bundle,
+    save_dck,
 )
 
 APP_VERSION = "1.1"
@@ -262,6 +269,14 @@ def help_html() -> str:
 """
     title = tr("사용법 및 단축키", "How to use & shortcuts")
     return f'<h2>{title}</h2>{body}'
+
+# 모드별 도구 버튼 순서(이동은 앞, 텍스트·지우개는 뒤로 고정)
+TOOL_ORDER = {
+    MODE_PROGRAM: [TOOL_HAND, TOOL_AUTOMARK, TOOL_HIGHLIGHTER, TOOL_PEN,
+                   TOOL_TEXT, TOOL_ERASER],
+    MODE_INSPECT: [TOOL_HAND, TOOL_PEN, TOOL_HIGHLIGHTER, TOOL_AUTOMARK,
+                   TOOL_TEXT, TOOL_ERASER],
+}
 
 # 색상 선택창의 "사용자 지정 색" 기본값 — 자주 쓰는 볼펜색
 CUSTOM_PEN_COLORS = ["#000000", "#15268F", "#D81E1E", "#1E8A3C"]  # 검정·파랑·빨강·초록
@@ -585,6 +600,10 @@ class MainWindow(QMainWindow):
         self._ocr_langs = ("en",)  # OCR 인식 언어(고정: 숫자/영문)
         self._autocheck_on = True  # 저장 시 마킹검사 여부(재빌드에도 유지)
         self._digits_only = False  # 숫자 포함(치수성) 항목만 검사
+        self._exclude_info = False  # 도면 정보(표제란/표) 테두리 안 글자 제외
+        self._boxed_cache: dict = {}  # id(page) -> 제외 박스 rect 키 집합
+        self._autosave_on = True   # 자동 저장(복구본) 사용 여부
+        self._dirty = False        # 마지막 저장 이후 편집 여부(자동 저장 판단용)
         self._fixed_dir_on = False  # 열기/저장 폴더 고정 사용 여부
         self._fixed_dir = ""        # 고정 폴더 경로
         self._last_dir = ""         # 마지막으로 열거나 저장한 폴더
@@ -596,7 +615,9 @@ class MainWindow(QMainWindow):
         self._nav_unmarked: list = []  # 미마킹 네비게이션 목록(현재 페이지)
         self._nav_idx = -1
         self._paste_text = ""  # Ctrl+V로 집어든 클립보드 텍스트(다음 클릭에 찍음)
+        self._paste_boxed = False  # 다음 배치가 스탬프(테두리 박스)인지
         self._text_angle = 0.0  # 텍스트 회전 각도(PageUp/Down으로 조절, 시계방향 +)
+        self._stamp_names = {MODE_PROGRAM: "", MODE_INSPECT: ""}  # 모드별 작성자/검사자
         self._automark_session: set = set()  # 현재 드래그에서 이미 칠한 박스(중복방지)
         self.canvas.autoMarkRequested.connect(self._on_automark)
         self.canvas.autoMarkStarted.connect(lambda: self._automark_session.clear())
@@ -612,6 +633,8 @@ class MainWindow(QMainWindow):
         self.canvas.layersChanged.connect(self._refresh_layer_combo)
         self.canvas.layersChanged.connect(self._update_progress)
         self.canvas.contentChanged.connect(self._update_progress)
+        self.canvas.contentChanged.connect(self._mark_dirty)
+        self.canvas.layersChanged.connect(self._mark_dirty)
         self._update_undo_actions()
         self._update_status()
         self._refresh_layer_combo()
@@ -621,6 +644,82 @@ class MainWindow(QMainWindow):
         self._sec_timer.setInterval(1000)
         self._sec_timer.timeout.connect(self._poll_security)
         self._sec_timer.start()
+
+        self._autosave_timer = QTimer(self)  # 자동 저장(복구본)
+        self._autosave_timer.setInterval(180_000)  # 3분
+        self._autosave_timer.timeout.connect(self._autosave_tick)
+        self._autosave_timer.start()
+
+    # ---------- 자동 저장 / 복구 ----------
+    def _mark_dirty(self):
+        self._dirty = True
+
+    def _recovery_path(self) -> str:
+        base = (QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppDataLocation)
+            or QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.TempLocation))
+        d = os.path.join(base, "DrawingChecker")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            d = base
+        return os.path.join(d, "recovery.dck")
+
+    def _autosave_tick(self):
+        """주기적으로 편집된 문서를 복구본(.dck)으로 저장."""
+        if not self._autosave_on or self.canvas.doc is None or not self._dirty:
+            return
+        try:
+            save_dck(self.canvas.doc, self._recovery_path())
+            self.status.showMessage(tr("자동 저장됨", "Auto-saved"), 1500)
+        except Exception:  # noqa: BLE001
+            pass  # 자동 저장 실패가 작업을 방해하지 않도록 조용히 무시
+
+    def _on_toggle_autosave(self, checked: bool):
+        self._autosave_on = checked
+        if not checked:
+            self._clear_recovery()
+        self.status.showMessage(
+            tr("자동 저장: ", "Auto-save: ") + (tr("켜짐", "ON") if checked else tr("꺼짐", "OFF")),
+            3000)
+
+    def _clear_recovery(self):
+        try:
+            p = self._recovery_path()
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+    def maybe_recover(self) -> bool:
+        """시작 시 복구본이 있으면 복구할지 묻는다. 복구하면 True."""
+        p = self._recovery_path()
+        if not os.path.isfile(p):
+            return False
+        ans = QMessageBox.question(
+            self, tr("작업 복구", "Recover work"),
+            tr("저장하지 않고 종료된 작업이 있습니다. 복구할까요?",
+               "Unsaved work from a previous session was found. Recover it?"))
+        if ans != QMessageBox.StandardButton.Yes:
+            self._clear_recovery()
+            return False
+        try:
+            doc = load_dck(p)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, tr("복구 실패", "Recovery failed"), str(exc))
+            self._clear_recovery()
+            return False
+        self._project_path = None  # 저장 위치는 새로 지정하도록
+        self._ocr_cache.clear()
+        self._boxed_cache.clear()
+        self._nav_unmarked = []
+        self._nav_idx = -1
+        self.canvas.set_document(doc)
+        self.setWindowTitle(f"{APP_TITLE} — {tr('복구된 작업', 'Recovered work')}")
+        self._dirty = True  # 아직 정식 저장 안 됨
+        self._update_status()
+        return True
 
     # ---------- 설정 저장/복원 ----------
     def _settings(self) -> QSettings:
@@ -634,6 +733,10 @@ class MainWindow(QMainWindow):
         s.setValue("ocr/device", get_device())
         s.setValue("ocr/autocheck", self._autocheck_on)
         s.setValue("ocr/digits_only", self._digits_only)
+        s.setValue("ocr/exclude_info", self._exclude_info)
+        s.setValue("app/autosave", self._autosave_on)
+        s.setValue("stamp/program", self._stamp_names.get(MODE_PROGRAM, ""))
+        s.setValue("stamp/inspect", self._stamp_names.get(MODE_INSPECT, ""))
         s.setValue("dir/fixed_on", self._fixed_dir_on)
         s.setValue("dir/fixed_path", self._fixed_dir)
         s.setValue("dir/last", self._last_dir)
@@ -714,6 +817,17 @@ class MainWindow(QMainWindow):
         do = s.value("ocr/digits_only", True, type=bool)
         self._digits_only = do
         self.act_digits_only.setChecked(do)
+        # 도면 정보 영역 제외(기본 OFF)
+        ei = s.value("ocr/exclude_info", False, type=bool)
+        self._exclude_info = ei
+        self.act_exclude_info.setChecked(ei)
+        # 자동 저장(기본 ON)
+        au = s.value("app/autosave", True, type=bool)
+        self._autosave_on = au
+        self.act_autosave.setChecked(au)
+        # 스탬프 이름
+        self._stamp_names[MODE_PROGRAM] = s.value("stamp/program", "") or ""
+        self._stamp_names[MODE_INSPECT] = s.value("stamp/inspect", "") or ""
         # 폴더(고정/마지막)
         self._fixed_dir = s.value("dir/fixed_path", "") or ""
         self._last_dir = s.value("dir/last", "") or ""
@@ -744,9 +858,10 @@ class MainWindow(QMainWindow):
                    "Eraser while held — release X to revert"), 2000)
             return
         if key == Qt.Key.Key_Escape and self._paste_text:
-            self._paste_text = ""  # 붙여넣기 대기 취소
+            self._paste_text = ""  # 붙여넣기/스탬프 대기 취소
+            self._paste_boxed = False
             self.canvas.clear_text_preview()
-            self.status.showMessage(tr("붙여넣기 취소", "Paste canceled"), 2000)
+            self.status.showMessage(tr("취소", "Canceled"), 2000)
             return
         # 텍스트 도구일 때 PageUp=시계방향, PageDown=반시계방향 회전(90°씩)
         if (self.canvas.tools.tool == TOOL_TEXT
@@ -779,6 +894,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._save_settings()
+        # 저장돼 깨끗하면 복구본 제거. 미저장 편집이 남았으면 다음 실행 때
+        # 복구할 수 있도록 복구본을 남겨둔다(자동 저장 켜진 경우).
+        if not self._dirty or not self._autosave_on:
+            self._clear_recovery()
         super().closeEvent(event)
 
     # ---------- 드래그앤드롭 열기 ----------
@@ -820,9 +939,11 @@ class MainWindow(QMainWindow):
             self._project_path = None
         self._remember(path)
         self._ocr_cache.clear()
+        self._boxed_cache.clear()
         self._nav_unmarked = []
         self._nav_idx = -1
         self.canvas.set_document(doc)
+        self._dirty = False  # 방금 연 상태 = 파일과 동일
         self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         self._update_status()
 
@@ -856,8 +977,32 @@ class MainWindow(QMainWindow):
         self.canvas.offset = QPointF(0, 0)
         self.canvas.update()
         self.canvas.viewChanged.emit()
+        self._dirty = False  # 빈 캔버스 = 저장할 내용 없음
         self.setWindowTitle(f"{APP_TITLE} — {tr('새 캔버스', 'New canvas')}")
         self._update_status()
+
+    def print_current(self):
+        """현재 페이지(배경+보이는 레이어)를 합쳐 프린터로 출력한다."""
+        page = self.canvas.page
+        if page is None:
+            QMessageBox.information(self, tr("인쇄", "Print"),
+                                    tr("먼저 이미지를 여세요.", "Open an image first."))
+            return
+        img = flatten_page(page)
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle(tr("인쇄", "Print"))
+        if dlg.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        painter = QPainter(printer)
+        vp = painter.viewport()
+        sz = img.size()
+        sz.scale(vp.size(), Qt.AspectRatioMode.KeepAspectRatio)  # 용지에 맞춰 축소
+        painter.setViewport(vp.x(), vp.y(), sz.width(), sz.height())
+        painter.setWindow(img.rect())
+        painter.drawImage(0, 0, img)
+        painter.end()
+        self.status.showMessage(tr("인쇄 전송됨", "Sent to printer"), 3000)
 
     # ---------- 액션/메뉴 ----------
     def _build_actions(self):
@@ -867,6 +1012,19 @@ class MainWindow(QMainWindow):
             tr("그림판처럼 낙서할 흰 바탕 캔버스 (Ctrl+N)",
                "Blank white canvas to doodle on (Ctrl+N)"))
         self.act_new_blank.triggered.connect(lambda: self.new_blank())
+
+        self.act_print = QAction(tr("인쇄…", "Print…"), self)
+        self.act_print.setShortcut(QKeySequence.StandardKey.Print)  # Ctrl+P
+        self.act_print.setToolTip(tr("현재 페이지를 인쇄 (Ctrl+P)", "Print current page (Ctrl+P)"))
+        self.act_print.triggered.connect(self.print_current)
+
+        self.act_autosave = QAction(tr("자동 저장", "Auto-save"), self)
+        self.act_autosave.setCheckable(True)
+        self.act_autosave.setChecked(self._autosave_on)
+        self.act_autosave.setToolTip(
+            tr("3분마다 복구본을 자동 저장하고, 다음 실행 시 복구를 제안합니다.",
+               "Auto-saves a recovery copy every 3 min; offers recovery on next launch."))
+        self.act_autosave.toggled.connect(self._on_toggle_autosave)
 
         self.act_open = QAction(_make_action_icon("open_image"), tr("이미지 열기", "Open Image"), self)
         self.act_open.setIconText(tr("이미지", "Image"))
@@ -948,6 +1106,20 @@ class MainWindow(QMainWindow):
                "Grab clipboard text, then click the canvas to place it (Ctrl+V)"))
         self.act_paste_text.triggered.connect(self._paste_text_from_clipboard)
 
+        self.act_stamp = QAction(tr("스탬프 찍기", "Place stamp"), self)
+        self.act_stamp.setShortcut("Ctrl+Shift+P")
+        self.act_stamp.setToolTip(
+            tr("현재 모드의 작성자/검사자 이름과 날짜·시간 도장을 찍습니다 (Ctrl+Shift+P)",
+               "Stamp the current mode's author/inspector name and date-time (Ctrl+Shift+P)"))
+        self.act_stamp.triggered.connect(self._place_stamp)
+
+        self.act_stamp_names = QAction(
+            tr("이 레이어 스탬프 이름 설정…", "Set this layer's stamp name…"), self)
+        self.act_stamp_names.setToolTip(
+            tr("현재 활성 레이어의 작성자/검사자 이름을 설정합니다(레이어별).",
+               "Set the author/inspector name for the active layer (per layer)."))
+        self.act_stamp_names.triggered.connect(self._set_stamp_names)
+
         self.act_fit = QAction(_make_action_icon("fit"), tr("화면맞춤", "Fit"), self)
         self.act_fit.setShortcut("Ctrl+0")
         self.act_fit.setToolTip(tr("화면맞춤 (Ctrl+0)", "Fit to window (Ctrl+0)"))
@@ -978,6 +1150,24 @@ class MainWindow(QMainWindow):
                "Only check items containing digits (dimensions/tolerances); skip plain words"))
         self.act_digits_only.toggled.connect(self._on_toggle_digits_only)
 
+        self.act_exclude_info = QAction(
+            tr("도면 정보 영역 제외(표제란·표)", "Exclude title-block/table text"), self)
+        self.act_exclude_info.setCheckable(True)
+        self.act_exclude_info.setChecked(self._exclude_info)
+        self.act_exclude_info.setToolTip(
+            tr("테두리로 둘러싸인 글자(표제란·주기·표 등)를 OCR 검사에서 제외\n"
+               "(자동 테두리 인식 — 도면에 따라 빗나갈 수 있음)",
+               "Skip text enclosed by borders (title block/notes/tables)\n"
+               "(auto border detection — may miss on some drawings)"))
+        self.act_exclude_info.toggled.connect(self._on_toggle_exclude_info)
+
+        self.act_export_check = QAction(
+            tr("검사 결과 내보내기(텍스트/CSV)…", "Export check report (text/CSV)…"), self)
+        self.act_export_check.setToolTip(
+            tr("미마킹(체크 안 된) 항목을 포함한 검사 결과를 파일로 저장",
+               "Save the check result (incl. unmarked items) to a file"))
+        self.act_export_check.triggered.connect(self.export_check_report)
+
         menu = self.menuBar()
         file_menu = menu.addMenu(tr("파일", "File"))
         file_menu.addAction(self.act_new_blank)
@@ -987,7 +1177,9 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.act_save_project)
         file_menu.addAction(self.act_save_project_as)
+        file_menu.addAction(self.act_autosave)
         file_menu.addSeparator()
+        file_menu.addAction(self.act_print)
         export_menu = file_menu.addMenu(tr("내보내기", "Export"))
         export_menu.addAction(self.act_export)
         export_menu.addAction(self.act_export_tiff)
@@ -1007,13 +1199,18 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.act_redo)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_paste_text)
+        edit_menu.addAction(self.act_stamp)
+        edit_menu.addAction(self.act_stamp_names)
         view_menu = menu.addMenu(tr("보기", "View"))
         view_menu.addAction(self.act_fit)
         check_menu = menu.addMenu(tr("검사", "Check"))
         check_menu.addAction(self.act_check)
         check_menu.addAction(self.act_next_unmark)
+        check_menu.addAction(self.act_export_check)
+        check_menu.addSeparator()
         check_menu.addAction(self.act_autocheck)
         check_menu.addAction(self.act_digits_only)
+        check_menu.addAction(self.act_exclude_info)
         engine_menu = check_menu.addMenu(tr("OCR 엔진", "OCR Engine"))
         self._engine_menu = engine_menu
         self.engine_group = QActionGroup(self)
@@ -1209,6 +1406,24 @@ class MainWindow(QMainWindow):
         self.addToolBar(pb)
         self._scale_toolbar_font(pb, 1.15)  # 이 줄 전체를 약 15% 키움
 
+        # 작업 모드 전환(프로그램 / 검사) — 모드별 레이어 그룹
+        pb.addWidget(QLabel(tr(" 모드 ", " Mode ")))
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_btns: dict[str, QPushButton] = {}
+        for mode, label in ((MODE_PROGRAM, tr("프로그램", "Program")),
+                            (MODE_INSPECT, tr("검사", "Inspect"))):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setToolTip(tr("이 모드의 레이어만 보이고 검사됩니다",
+                            "Only this mode's layers are shown and checked"))
+            b.clicked.connect(lambda _c=False, m=mode: self._set_mode(m))
+            self.mode_group.addButton(b)
+            pb.addWidget(b)
+            self.mode_btns[mode] = b
+        self.mode_btns[MODE_PROGRAM].setChecked(True)
+        pb.addSeparator()
+
         # 레이어 그룹 (지정 색상 바로 왼쪽)
         pb.addWidget(QLabel(tr(" 레이어 ", " Layer ")))
         self.layer_combo = QComboBox()
@@ -1256,14 +1471,17 @@ class MainWindow(QMainWindow):
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
         self.tool_actions: dict[str, QAction] = {}
-        for tool, label, shortcut in (
-            (TOOL_HAND, tr("이동", "Hand"), "Space"),
-            (TOOL_AUTOMARK, tr("자동마킹", "Auto-mark"), "A"),
-            (TOOL_HIGHLIGHTER, tr("형광펜", "Highlighter"), "H"),
-            (TOOL_PEN, tr("펜", "Pen"), "P"),
-            (TOOL_TEXT, tr("텍스트", "Text"), "T"),
-            (TOOL_ERASER, tr("지우개", "Eraser"), "E"),
-        ):
+        tool_meta = {
+            TOOL_HAND: (tr("이동", "Hand"), "Space"),
+            TOOL_AUTOMARK: (tr("자동마킹", "Auto-mark"), "A"),
+            TOOL_HIGHLIGHTER: (tr("형광펜", "Highlighter"), "H"),
+            TOOL_PEN: (tr("펜", "Pen"), "P"),
+            TOOL_TEXT: (tr("텍스트", "Text"), "T"),
+            TOOL_ERASER: (tr("지우개", "Eraser"), "E"),
+        }
+        cur_mode = self.canvas.page.current_mode if self.canvas.page else MODE_PROGRAM
+        for tool in TOOL_ORDER.get(cur_mode, TOOL_ORDER[MODE_PROGRAM]):
+            label, shortcut = tool_meta[tool]
             icon = (_make_action_icon("automark") if tool == TOOL_AUTOMARK
                     else _make_tool_icon(tool))
             act = QAction(icon, f"{label}({shortcut})", self)
@@ -1276,11 +1494,14 @@ class MainWindow(QMainWindow):
             self.tool_actions[tool] = act
         self.tool_actions[self.canvas.tools.tool].setChecked(True)
 
+        self._pb = pb  # 모드 전환 시 도구 순서 재배치용
+
         self.pen_color_btn = QPushButton()
         self.pen_color_btn.setToolTip(tr("펜 색상", "Pen color"))
         self.pen_color_btn.setStyleSheet(_color_button_style(self.canvas.tools.pen_color))
         self.pen_color_btn.clicked.connect(self._pick_pen_color)
-        pb.addWidget(QLabel(tr(" 펜 ", " Pen ")))
+        # 도구 그룹 바로 뒤(이 라벨)를 앵커로 잡아 도구를 그 앞에 재배치한다
+        self._tools_anchor = pb.addWidget(QLabel(tr(" 펜 ", " Pen ")))
         pb.addWidget(self.pen_color_btn)
 
         self.hl_color_btn = QPushButton()
@@ -1401,12 +1622,13 @@ class MainWindow(QMainWindow):
 
         self.layer_combo.clear()
         if has_page:
-            # 상단 레이어가 위에 오도록 역순으로 표시
-            for index in range(len(page.layers) - 1, -1, -1):
+            # 현재 모드(그룹) 레이어만, 상단이 위에 오도록 역순으로 표시
+            cur_idx = page.mode_indices()  # 절대 인덱스(아래→위)
+            for index in reversed(cur_idx):
                 self.layer_combo.addItem(page.layers[index].name, index)
             self.layer_combo.addItem("➕ 새 레이어 추가", self.ADD_LAYER_DATA)
-            active_row = len(page.layers) - 1 - page.active_index
-            self.layer_combo.setCurrentIndex(active_row)
+            pos = cur_idx.index(page.active_index)  # 그룹 내 위치(아래→위)
+            self.layer_combo.setCurrentIndex(len(cur_idx) - 1 - pos)
 
             active = page.active_layer
             self.opacity_slider.setValue(int(active.opacity * 100))
@@ -1419,10 +1641,17 @@ class MainWindow(QMainWindow):
         self.layer_visible_btn.setEnabled(has_page)
         self.opacity_slider.setEnabled(has_page)
         self.blend_combo.setEnabled(has_page)
-        # 마지막 한 장은 삭제 불가
-        self.layer_delete_btn.setEnabled(has_page and len(page.layers) > 1)
-        self.layer_up_btn.setEnabled(has_page and page.active_index < len(page.layers) - 1)
-        self.layer_down_btn.setEnabled(has_page and page.active_index > 0)
+        if has_page:
+            cur_idx = page.mode_indices()
+            pos = cur_idx.index(page.active_index)
+            # 현재 모드 안에서 최소 한 장 유지 / 위·아래 선택 가능 여부
+            self.layer_delete_btn.setEnabled(len(cur_idx) > 1)
+            self.layer_up_btn.setEnabled(pos < len(cur_idx) - 1)
+            self.layer_down_btn.setEnabled(pos > 0)
+        else:
+            for b in (self.layer_delete_btn, self.layer_up_btn, self.layer_down_btn):
+                b.setEnabled(False)
+        self._sync_mode_buttons()
         self._layer_controls_updating = False
 
     def _on_layer_combo_changed(self, _index: int):
@@ -1444,14 +1673,63 @@ class MainWindow(QMainWindow):
         self.canvas.page.active_layer.visible = checked
         self.canvas.notify_layers_changed()
 
+    def _apply_tool_order(self, mode: str):
+        """현재 모드에 맞춰 툴바의 도구 버튼 순서를 재배치한다."""
+        if not hasattr(self, "_pb") or not hasattr(self, "_tools_anchor"):
+            return
+        for tool in TOOL_ORDER.get(mode, TOOL_ORDER[MODE_PROGRAM]):
+            act = self.tool_actions.get(tool)
+            if act is None:
+                continue
+            self._pb.removeAction(act)
+            self._pb.insertAction(self._tools_anchor, act)  # 앵커 앞에 차례로
+
+    def _mode_label(self, mode: str) -> str:
+        return tr("프로그램", "Program") if mode == MODE_PROGRAM else tr("검사", "Inspect")
+
+    def _sync_mode_buttons(self):
+        page = self.canvas.page
+        if page is None or not hasattr(self, "mode_btns"):
+            return
+        b = self.mode_btns.get(page.current_mode)
+        if b is not None and not b.isChecked():
+            b.blockSignals(True)
+            b.setChecked(True)
+            b.blockSignals(False)
+        self._apply_tool_order(page.current_mode)  # 도구 순서도 모드에 맞춤
+
+    def _set_mode(self, mode: str):
+        """작업 모드(레이어 그룹) 전환. 다른 모드 마킹은 숨고 검사도 모드별 독립.
+
+        문서 전체(모든 페이지)에 적용해 페이지를 넘겨도 같은 모드가 유지된다.
+        """
+        doc = self.canvas.doc
+        if doc is None:
+            self._sync_mode_buttons()
+            return
+        changed = False
+        for pg in doc.pages:
+            if pg.set_mode(mode):
+                changed = True
+        if not changed:
+            return
+        self._apply_tool_order(mode)     # 모드별 도구 버튼 순서
+        self.canvas.clear_overlay()      # 이전 모드 미마킹 표시 제거
+        self._nav_unmarked = []
+        self._nav_idx = -1
+        self.canvas.notify_layers_changed()  # 합성·레이어 콤보 갱신
+        self._refresh_check_overlay()        # 이 모드 기준으로 미마킹/진척도 재계산
+        self.status.showMessage(tr("모드: ", "Mode: ") + self._mode_label(mode), 3000)
+
     def _select_adjacent_layer(self, delta: int):
-        """활성(선택) 레이어를 위(+1)/아래(-1) 레이어로 전환한다."""
+        """활성(선택) 레이어를 현재 모드 안에서 위(+1)/아래(-1)로 전환한다."""
         page = self.canvas.page
         if page is None:
             return
-        new_index = page.active_index + delta
-        if 0 <= new_index < len(page.layers):
-            page.active_index = new_index
+        cur_idx = page.mode_indices()
+        pos = cur_idx.index(page.active_index) + delta
+        if 0 <= pos < len(cur_idx):
+            page.active_index = cur_idx[pos]
             self.canvas.notify_layers_changed()  # 캔버스/컨트롤 동기화
 
     def _on_opacity_changed(self, value: int):
@@ -1512,8 +1790,9 @@ class MainWindow(QMainWindow):
         self.canvas.tools.tool = tool
         if tool in self.tool_actions:
             self.tool_actions[tool].setChecked(True)
-        if tool != TOOL_TEXT and self._paste_text:  # 다른 도구로 가면 붙여넣기 취소
+        if tool != TOOL_TEXT and self._paste_text:  # 다른 도구로 가면 붙여넣기/스탬프 취소
             self._paste_text = ""
+            self._paste_boxed = False
             self.canvas.clear_text_preview()
         self.canvas.apply_tool_cursor()  # 손 도구면 손바닥 커서
         # 굵기 스핀을 도구별 값으로 동기화
@@ -1787,6 +2066,8 @@ class MainWindow(QMainWindow):
             return
         self._project_path = path
         self.canvas.doc.path = path
+        self._dirty = False          # 정식 저장됨
+        self._clear_recovery()       # 복구본 불필요
         self.setWindowTitle(f"{APP_TITLE} — {os.path.basename(path)}")
         names = ", ".join(os.path.basename(w) for w in written)
         self.status.showMessage(f"저장됨({len(written)}개): {names}", 5000)
@@ -2012,18 +2293,37 @@ class MainWindow(QMainWindow):
     def _cache_key(self, page):
         return (id(page), self._ocr_engine, self._ocr_langs)
 
+    @staticmethod
+    def _rk(rect):
+        return (rect.left(), rect.top(), rect.width(), rect.height())
+
+    def _boxed_excluded(self, page) -> set:
+        """이 페이지에서 테두리(표제란/표) 안에 든 박스들의 rect 키 집합(캐시).
+
+        OCR 박스 리스트 객체 식별자로 캐시 → 재검출(새 리스트)되면 자동 무효화.
+        """
+        raw = self._ocr_cache.get(self._cache_key(page)) or []
+        k = id(raw)
+        if k not in self._boxed_cache:
+            kept = {self._rk(it.rect) for it in filter_boxed_text(page.base, raw)}
+            self._boxed_cache[k] = {self._rk(it.rect) for it in raw} - kept
+        return self._boxed_cache[k]
+
     def _get_boxes(self, page):
-        """캐시된 OCR 박스를 반환(숫자·치수 필터 적용). 미검출이면 None."""
+        """캐시된 OCR 박스를 반환(숫자·치수/도면정보 필터 적용). 미검출이면 None."""
         raw = self._ocr_cache.get(self._cache_key(page))
         if raw is None:
             return None
+        boxes = raw
         if self._digits_only:
-            return [b for b in raw if any(ch.isdigit() for ch in b.text)]
-        return raw
+            boxes = [b for b in boxes if any(ch.isdigit() for ch in b.text)]
+        if self._exclude_info:
+            ex = self._boxed_excluded(page)
+            boxes = [b for b in boxes if self._rk(b.rect) not in ex]
+        return boxes
 
-    def _on_toggle_digits_only(self, checked: bool):
-        self._digits_only = checked
-        # 재검출 불필요(읽기 시 필터) — 표시만 갱신
+    def _refresh_check_overlay(self):
+        """현재 필터로 미마킹 오버레이·진척도를 다시 계산해 표시(재검출 불필요)."""
         page = self.canvas.page
         if page is not None and self._get_boxes(page) is not None:
             unmarked = find_unmarked(page, self._get_boxes(page))
@@ -2031,6 +2331,17 @@ class MainWindow(QMainWindow):
             self._nav_unmarked = unmarked
             self._nav_idx = -1
         self._update_progress()
+
+    def _on_toggle_digits_only(self, checked: bool):
+        self._digits_only = checked
+        self._refresh_check_overlay()
+
+    def _on_toggle_exclude_info(self, checked: bool):
+        self._exclude_info = checked
+        self.status.showMessage(
+            tr("도면 정보(표제란/표) 글자 제외: ", "Exclude title-block/table text: ")
+            + (tr("켜짐", "ON") if checked else tr("꺼짐", "OFF")), 3000)
+        self._refresh_check_overlay()
 
     def _ensure_boxes(self, pages, title: str) -> bool:
         """필요한 페이지의 OCR을 백그라운드로 수행(진행률·취소). 완료 True/취소 False.
@@ -2120,6 +2431,92 @@ class MainWindow(QMainWindow):
                f"Found {len(unmarked)} unmarked text items (of {len(boxes)}).\n"
                f"Shown with red dashes. Press 'N' to cycle through them.\n\n{sample}{more}"))
 
+    def export_check_report(self):
+        """현재 모드 기준으로 전 페이지를 검사해 결과를 텍스트/CSV로 저장한다.
+
+        각 검출 항목의 텍스트·마킹여부·위치를 담는다(특히 체크 안 된 미마킹 항목).
+        """
+        doc = self.canvas.doc
+        if doc is None:
+            QMessageBox.information(self, tr("검사 결과 내보내기", "Export check report"),
+                                    tr("먼저 이미지를 여세요.", "Open an image first."))
+            return
+        try:
+            if not self._ensure_boxes(doc.pages, tr("OCR 검사 중…", "Running OCR…")):
+                return
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, tr("검사 실패", "Check failed"), str(exc))
+            return
+
+        mode_name = self._mode_label(doc.pages[0].current_mode) if doc.pages else ""
+        rows = []  # (page, text, status_marked, x, y, w, h)
+        unmarked_rows = []
+        total = marked = 0
+        for pi, page in enumerate(doc.pages):
+            boxes = self._get_boxes(page) or []
+            um_ids = {id(b) for b in find_unmarked(page, boxes)}
+            for b in boxes:
+                is_um = id(b) in um_ids
+                r = b.rect
+                row = (pi + 1, b.text, not is_um, r.left(), r.top(), r.width(), r.height())
+                rows.append(row)
+                total += 1
+                if is_um:
+                    unmarked_rows.append(row)
+                else:
+                    marked += 1
+        unmarked = total - marked
+
+        default = f"검사결과_{mode_name}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("검사 결과 내보내기", "Export check report"),
+            self._save_start(default),
+            "CSV (*.csv);;텍스트 (*.txt)")
+        if not path:
+            return
+        self._remember(path)
+        try:
+            if path.lower().endswith(".txt"):
+                self._write_report_txt(path, mode_name, total, marked, unmarked,
+                                       unmarked_rows)
+            else:
+                if not path.lower().endswith(".csv"):
+                    path += ".csv"
+                self._write_report_csv(path, mode_name, rows)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, tr("저장 실패", "Save failed"), str(exc))
+            return
+        self.status.showMessage(
+            tr(f"검사 결과 저장: 미마킹 {unmarked}/{total}개 · {os.path.basename(path)}",
+               f"Report saved: {unmarked}/{total} unmarked · {os.path.basename(path)}"), 6000)
+
+    def _write_report_csv(self, path, mode_name, rows):
+        # Excel 한글 호환을 위해 UTF-8 BOM
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            wr = csv.writer(f)
+            wr.writerow([tr("모드", "Mode"), tr("페이지", "Page"), tr("텍스트", "Text"),
+                         tr("상태", "Status"), "x", "y", "w", "h"])
+            for (pg, text, is_marked, x, y, w, h) in rows:
+                st = tr("마킹", "Marked") if is_marked else tr("미마킹", "Unmarked")
+                wr.writerow([mode_name, pg, text, st, x, y, w, h])
+
+    def _write_report_txt(self, path, mode_name, total, marked, unmarked, unmarked_rows):
+        lines = [
+            f"Drawing Checker — {tr('검사 결과', 'Check report')}",
+            f"{tr('모드', 'Mode')}: {mode_name}",
+            f"{tr('전체', 'Total')}: {total}   {tr('마킹', 'Marked')}: {marked}   "
+            f"{tr('미마킹', 'Unmarked')}: {unmarked}",
+            "",
+            f"[{tr('미마킹(체크 안 됨) 항목', 'Unmarked items')}]",
+        ]
+        if unmarked_rows:
+            for (pg, text, _m, x, y, w, h) in unmarked_rows:
+                lines.append(f"  - p{pg}  '{text}'  @({x},{y},{w}x{h})")
+        else:
+            lines.append(f"  {tr('없음 — 모두 마킹됨 ✅', 'None — all marked ✅')}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
     def goto_next_unmarked(self):
         """미마킹 항목을 차례로 화면 중앙에 보여준다."""
         if self.canvas.page is None:
@@ -2183,6 +2580,67 @@ class MainWindow(QMainWindow):
                "Paste: follows cursor — click to place / PageUp·Down rotate / Esc cancel"),
             8000)
 
+    def _stamp_role(self, mode: str) -> str:
+        return (tr("프로그램 작성자", "Program by") if mode == MODE_PROGRAM
+                else tr("검사자", "Inspected by"))
+
+    def _place_stamp(self):
+        """현재 '활성 레이어'의 스탬프(역할+이름+날짜시간)를 클릭 위치에 찍게 한다.
+
+        이름은 레이어별로 따로 가진다(레이어마다 작성자/검사자가 다를 수 있음).
+        """
+        page = self.canvas.page
+        if page is None:
+            QMessageBox.information(self, tr("스탬프", "Stamp"),
+                                    tr("먼저 이미지를 여세요.", "Open an image first."))
+            return
+        layer = page.active_layer
+        mode = page.current_mode
+        role = self._stamp_role(mode)
+        name = getattr(layer, "stamp_name", "") or ""
+        if not name:
+            default = self._stamp_names.get(mode, "")  # 재실행에도 유지되는 기본 이름
+            if default:
+                name = default          # 저장된 기본값이 있으면 묻지 않고 자동 적용
+                layer.stamp_name = default
+            else:                       # 처음 한 번만 물어보고 기본값으로 저장
+                name, ok = QInputDialog.getText(
+                    self, role,
+                    tr(f"[{layer.name}] 이름을 입력하세요:", f"[{layer.name}] enter name:"))
+                if not ok or not name.strip():
+                    return
+                layer.stamp_name = name.strip()
+                self._stamp_names[mode] = name.strip()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        text = f"{role}: {layer.stamp_name}\n{ts}"
+        self._paste_text = text
+        self._paste_boxed = True
+        self._select_tool(TOOL_TEXT)
+        self.canvas.set_text_preview(text, self._text_angle)
+        self.status.showMessage(
+            tr("스탬프: 찍을 위치를 클릭하세요(Esc 취소)",
+               "Stamp: click where to place it (Esc to cancel)"), 6000)
+
+    def _set_stamp_names(self):
+        """현재 활성 레이어의 스탬프 이름을 설정한다(레이어별)."""
+        page = self.canvas.page
+        if page is None:
+            QMessageBox.information(self, tr("스탬프 이름", "Stamp name"),
+                                    tr("먼저 이미지를 여세요.", "Open an image first."))
+            return
+        layer = page.active_layer
+        role = self._stamp_role(page.current_mode)
+        name, ok = QInputDialog.getText(
+            self, tr("스탬프 이름 설정", "Set stamp name"),
+            f"[{layer.name}] {role}:", text=getattr(layer, "stamp_name", ""))
+        if ok:
+            layer.stamp_name = name.strip()
+            if name.strip():
+                self._stamp_names[page.current_mode] = name.strip()
+            self.status.showMessage(
+                tr(f"'{layer.name}' 스탬프 이름: ", f"'{layer.name}' stamp name: ")
+                + (name.strip() or tr("(없음)", "(none)")), 3000)
+
     def _on_text_request(self, img_pt: QPointF):
         """텍스트 도구: 클릭 위치에 글자를 그린다(펜 색·현재 글자크기).
 
@@ -2196,13 +2654,17 @@ class MainWindow(QMainWindow):
                 self, tr("텍스트", "Text"),
                 tr("숨긴 레이어에는 입력할 수 없습니다.", "Cannot type on a hidden layer."))
             return
-        if self._paste_text:  # 붙여넣기 대기 중 → 입력창 생략하고 바로 찍기
+        if self._paste_text:  # 붙여넣기/스탬프 대기 중 → 입력창 생략하고 바로 찍기
             text = self._paste_text
+            boxed = self._paste_boxed
             self._paste_text = ""
+            self._paste_boxed = False
             self.canvas.clear_text_preview()
-            if self.canvas.add_text(img_pt, text, self._text_angle):
+            if self.canvas.add_text(img_pt, text, self._text_angle, boxed=boxed):
                 self._update_undo_actions()
-                self.status.showMessage(tr("붙여넣기 완료", "Pasted"), 2000)
+                self.status.showMessage(
+                    tr("스탬프 찍음", "Stamped") if boxed else tr("붙여넣기 완료", "Pasted"),
+                    2000)
             return
         text, ok = QInputDialog.getMultiLineText(
             self, tr("텍스트 입력", "Enter text"),

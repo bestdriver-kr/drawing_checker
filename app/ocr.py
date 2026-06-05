@@ -450,13 +450,79 @@ except Exception:
 
 
 # ---------------------------------------------------------------- 마킹 판정
+def filter_boxed_text(base: QImage, boxes: list[TextItem],
+                      min_sides: int = 3, coverage: float = 0.5) -> list[TextItem]:
+    """표제란·표 등 '테두리로 둘러싸인' 글자를 제외한 목록을 반환한다.
+
+    각 텍스트 박스의 상/하/좌/우 바깥쪽 좁은 띠에서 박스 길이의 coverage 이상을
+    차지하는 '긴 선'이 있는지 본다. min_sides 면 이상이 선으로 둘러싸이면 표 칸/
+    테두리 안(도면 정보)으로 간주해 뺀다. cv2가 없으면 원본을 그대로 반환.
+    """
+    if not boxes:
+        return boxes
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001
+        return boxes
+    rgb = qimage_to_rgb(base)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    H, W = gray.shape
+    bw = cv2.threshold(gray, 0, 255,
+                       cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    hlen = max(15, W // 40)
+    vlen = max(15, H // 40)
+    horiz = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (hlen, 1)))
+    vert = cv2.morphologyEx(
+        bw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, vlen)))
+
+    def has_h(y0, y1, x0, x1):
+        if y1 <= y0 or x1 <= x0:
+            return False
+        sub = horiz[y0:y1, x0:x1]
+        return sub.size > 0 and (sub > 0).sum(axis=1).max() >= coverage * (x1 - x0)
+
+    def has_v(y0, y1, x0, x1):
+        if y1 <= y0 or x1 <= x0:
+            return False
+        sub = vert[y0:y1, x0:x1]
+        return sub.size > 0 and (sub > 0).sum(axis=0).max() >= coverage * (y1 - y0)
+
+    kept: list[TextItem] = []
+    for it in boxes:
+        r = it.rect
+        x, y, w, h = r.left(), r.top(), r.width(), r.height()
+        x0, x1 = max(0, x), min(W, x + w)
+        y0, y1 = max(0, y), min(H, y + h)
+        my = max(6, int(1.0 * h))   # 위/아래 탐색 거리
+        mx = max(8, int(1.5 * h))   # 좌/우 탐색 거리(글자~칸 테두리)
+        sides = 0
+        if has_h(max(0, y - my), y, x0, x1):
+            sides += 1
+        if has_h(y + h, min(H, y + h + my), x0, x1):
+            sides += 1
+        if has_v(y0, y1, max(0, x - mx), x):
+            sides += 1
+        if has_v(y0, y1, x + w, min(W, x + w + mx)):
+            sides += 1
+        if sides < min_sides:
+            kept.append(it)
+    return kept
+
+
 def find_unmarked(page: Page, boxes: list[TextItem],
                   alpha_thresh: int = 0) -> list[TextItem]:
-    """보이는 주석 레이어 기준으로 마커가 없는 텍스트 항목을 반환한다."""
+    """보이는 주석 레이어 기준으로 마커가 없는 텍스트 항목을 반환한다.
+
+    현재 모드(레이어 그룹)에 속한 레이어만 마킹으로 인정한다(모드별 독립 검사).
+    """
+    mode = getattr(page, "current_mode", None)
     combined: np.ndarray | None = None
     for layer in page.layers:
         if not layer.visible:
             continue
+        if mode is not None and getattr(layer, "group", mode) != mode:
+            continue  # 다른 모드 레이어는 검사 대상 아님
         a = _alpha_array(layer.image)
         combined = a if combined is None else np.maximum(combined, a)
     if combined is None:

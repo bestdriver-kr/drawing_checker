@@ -21,6 +21,7 @@ from PySide6.QtGui import QImage, QPainter
 from .layer import (
     BLEND_MULTIPLY,
     BLEND_NORMAL,
+    MODE_PROGRAM,
     Document,
     Layer,
     Page,
@@ -131,9 +132,10 @@ def export_pdf(pages: list[Page], path: str) -> None:
         bw, bh, brgb, ba = _qimage_rgb_alpha(page.base)
         xobjects[Name("/ImBase")] = make_image(bw, bh, brgb, ba)
 
-        # 상단 레이어가 PDF 패널 위에 오도록 역순 처리
-        for li in range(len(page.layers) - 1, -1, -1):
-            layer = page.layers[li]
+        # 현재 모드 레이어만, 상단이 PDF 패널 위에 오도록 역순 처리
+        mlayers = _mode_layers(page)
+        for li in range(len(mlayers) - 1, -1, -1):
+            layer = mlayers[li]
             iw, ih, irgb, ia = _qimage_rgb_alpha(layer.image)
             im_name = f"Im{li}"
             oc_name = f"OC{li}"
@@ -171,13 +173,21 @@ def export_pdf(pages: list[Page], path: str) -> None:
     pdf.save(path)
 
 
+def _mode_layers(page: Page) -> list:
+    """현재 모드(레이어 그룹)에 속한 레이어만 반환(모드 개념 없으면 전체)."""
+    mode = getattr(page, "current_mode", None)
+    if mode is None:
+        return list(page.layers)
+    return [l for l in page.layers if getattr(l, "group", mode) == mode]
+
+
 def flatten_page(page: Page) -> QImage:
-    """한 페이지의 배경 + 보이는 레이어를 합쳐 한 장의 이미지로 만든다(흰 배경)."""
+    """한 페이지의 배경 + (현재 모드의) 보이는 레이어를 한 장으로 합친다(흰 배경)."""
     flat = QImage(page.size, QImage.Format.Format_ARGB32_Premultiplied)
     flat.fill(Qt.GlobalColor.white)
     p = QPainter(flat)
     p.drawImage(0, 0, page.base)
-    for layer in page.layers:
+    for layer in _mode_layers(page):
         if not layer.visible:
             continue
         p.setOpacity(layer.opacity)
@@ -202,6 +212,7 @@ def save_dck(doc: Document, path: str) -> None:
             page_meta = {
                 "size": [page.size.width(), page.size.height()],
                 "active_index": page.active_index,
+                "current_mode": getattr(page, "current_mode", None),
                 "base": base_path,
                 "layers": [],
             }
@@ -214,6 +225,8 @@ def save_dck(doc: Document, path: str) -> None:
                     "visible": layer.visible,
                     "opacity": layer.opacity,
                     "blend": layer.blend,
+                    "group": getattr(layer, "group", None),
+                    "stamp_name": getattr(layer, "stamp_name", ""),
                     "strokes": [{
                         "tool": s.tool,
                         "color": list(s.color),
@@ -224,6 +237,7 @@ def save_dck(doc: Document, path: str) -> None:
                            if s.mask else {}),
                         **({"text": s.text} if s.text else {}),
                         **({"angle": s.angle} if s.angle else {}),
+                        **({"boxed": True} if s.boxed else {}),
                     } for s in layer.strokes],
                 })
             manifest["pages"].append(page_meta)
@@ -257,10 +271,12 @@ def load_dck(path: str) -> Document:
             layers: list[Layer] = []
             for lm in page_meta["layers"]:
                 img = _as_premultiplied(_png_bytes_to_qimage(zf.read(lm["file"])))
-                layer = Layer(lm["name"], base.size(), image=img)
+                layer = Layer(lm["name"], base.size(), image=img,
+                              group=lm.get("group") or MODE_PROGRAM)
                 layer.visible = bool(lm.get("visible", True))
                 layer.opacity = float(lm.get("opacity", 1.0))
                 layer.blend = lm.get("blend", BLEND_NORMAL)
+                layer.stamp_name = lm.get("stamp_name", "") or ""
                 layer.strokes = [
                     Stroke(
                         tool=sd["tool"],
@@ -271,15 +287,22 @@ def load_dck(path: str) -> Document:
                         mask=(base64.b64decode(sd["mask"]) if sd.get("mask") else None),
                         text=sd.get("text", ""),
                         angle=float(sd.get("angle", 0.0)),
+                        boxed=bool(sd.get("boxed", False)),
                     )
                     for sd in lm.get("strokes", [])
                 ]
                 layers.append(layer)
             if layers:
                 page.layers = layers
-            page.active_index = min(
-                page_meta.get("active_index", 0), len(page.layers) - 1
-            )
+            # 모드 복원(구버전 .dck는 전부 프로그램 그룹)
+            page.current_mode = page_meta.get("current_mode") or MODE_PROGRAM
+            if not page.mode_indices(page.current_mode):
+                page.current_mode = page.layers[0].group
+            ai = min(page_meta.get("active_index", 0), len(page.layers) - 1)
+            # 활성 레이어는 현재 모드 그룹 안에 있어야 함
+            if page.layers[ai].group != page.current_mode:
+                ai = page.mode_indices(page.current_mode)[0]
+            page.active_index = ai
             pages.append(page)
 
     # Document를 만들고 페이지를 복원본으로 교체
@@ -297,10 +320,11 @@ def _ora_stack_xml(page: Page) -> str:
         f'<image w="{w}" h="{h}" version="0.0.3">',
         "  <stack>",
     ]
-    # 최상단 레이어가 먼저 오도록 역순. 인덱스 0(맨 아래)부터 차곡차곡 data/에 저장.
-    n = len(page.layers)
+    # 현재 모드 레이어만. 최상단이 먼저 오도록 역순.
+    mlayers = _mode_layers(page)
+    n = len(mlayers)
     for li in range(n - 1, -1, -1):
-        layer = page.layers[li]
+        layer = mlayers[li]
         comp = _BLEND_TO_ORA.get(layer.blend, "svg:src-over")
         vis = "visible" if layer.visible else "hidden"
         lines.append(
@@ -327,7 +351,7 @@ def export_ora(page: Page, merged: QImage, path: str) -> None:
 
         zf.writestr("stack.xml", _ora_stack_xml(page))
         zf.writestr("data/base.png", _qimage_to_png_bytes(page.base))
-        for li, layer in enumerate(page.layers):
+        for li, layer in enumerate(_mode_layers(page)):
             zf.writestr(f"data/layer{li}.png", _qimage_to_png_bytes(layer.image))
         zf.writestr("mergedimage.png", _qimage_to_png_bytes(merged))
         thumb = merged.scaled(

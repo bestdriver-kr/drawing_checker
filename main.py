@@ -48,6 +48,8 @@ def main():
     path = _file_arg(sys.argv)  # 더블클릭/파일 연결로 넘어온 파일 즉시 열기
     if path:
         window._open_path(path)
+    elif window.maybe_recover():  # 미저장 작업 복구본이 있으면 제안
+        pass
     else:
         # 레이아웃이 잡힌(최대화 적용) 뒤 캔버스 크기에 맞춰 흰 바탕 생성
         QTimer.singleShot(0, window.new_blank)

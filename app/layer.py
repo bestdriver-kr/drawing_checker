@@ -65,6 +65,7 @@ class Stroke:
     # 텍스트(STROKE_TEXT) 전용: 글자 내용. width=글자 픽셀 크기, points[0]=좌상단.
     text: str = ""
     angle: float = 0.0  # 텍스트 회전 각도(도, 시계방향 +)
+    boxed: bool = False  # True면 글자 둘레에 테두리 박스(스탬프/도장)
 
 
 def _stroke_qpen(color_rgba, width: float) -> QPen:
@@ -201,6 +202,14 @@ def _paint_text(image: QImage, stroke: Stroke):
     p.translate(x, y)              # 좌상단을 기준점으로
     if stroke.angle:
         p.rotate(stroke.angle)     # 시계방향 +
+    if stroke.boxed:               # 스탬프: 글자 둘레에 테두리 박스
+        tw, th = text_bounds(stroke)
+        pad = max(4, int(stroke.width * 0.4))
+        pen = QPen(QColor(*stroke.color), max(1.5, stroke.width * 0.09))
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRect(-pad, -pad, tw + 2 * pad, th + 2 * pad))
+        p.setPen(QColor(*stroke.color))
     for i, line in enumerate(stroke.text.split("\n")):
         p.drawText(0, asc + i * lh, line)
     p.end()
@@ -285,15 +294,31 @@ def stroke_hit(stroke: Stroke, px: float, py: float, tol: float) -> bool:
     return False
 
 
+# 작업 모드(= 레이어 그룹). 같은 도면을 모드별로 따로 마킹/검사한다.
+MODE_PROGRAM = "program"
+MODE_INSPECT = "inspect"
+MODES = (MODE_PROGRAM, MODE_INSPECT)
+
+# 새 문서를 열 때 모드별 기본 레이어 이름(아래→위 순서)
+DEFAULT_LAYERS = {
+    MODE_PROGRAM: ["CNC/MTM", "MCT"],
+    MODE_INSPECT: ["검사"],
+}
+DEFAULT_LAYER_NAMES = DEFAULT_LAYERS[MODE_PROGRAM]  # 하위호환
+
+
 class Layer:
     """그림을 그릴 수 있는 투명 레이어 한 장."""
 
-    def __init__(self, name: str, size: QSize, image: QImage | None = None):
+    def __init__(self, name: str, size: QSize, image: QImage | None = None,
+                 group: str = MODE_PROGRAM):
         self.name = name
         self.image = image if image is not None else new_transparent_image(size)
         self.visible = True
         self.opacity = 1.0
         self.blend = BLEND_NORMAL
+        self.group = group  # 속한 모드(MODE_PROGRAM/MODE_INSPECT)
+        self.stamp_name = ""  # 이 레이어의 스탬프 이름(작성자/검사자)
         self.strokes: list[Stroke] = []  # 객체 단위 지우개용 획 기록
 
     def rerender(self):
@@ -303,18 +328,18 @@ class Layer:
             paint_stroke(self.image, stroke)
 
 
-# 새 문서를 열 때 기본으로 만들어지는 레이어 이름(아래→위 순서)
-DEFAULT_LAYER_NAMES = ["CNC/MTM", "MCT"]
-
-
 class Page:
-    """배경 이미지 한 장과 그 위의 주석 레이어들."""
+    """배경 이미지 한 장과 그 위의 주석 레이어들(모드별 그룹)."""
 
     def __init__(self, base_image: QImage):
         self.base = base_image
         size = base_image.size()
-        self.layers: list[Layer] = [Layer(name, size) for name in DEFAULT_LAYER_NAMES]
-        self.active_index = 0
+        self.layers: list[Layer] = []
+        for mode in MODES:  # 모드별 기본 레이어를 그룹 태그와 함께 생성
+            for name in DEFAULT_LAYERS[mode]:
+                self.layers.append(Layer(name, size, group=mode))
+        self.current_mode = MODE_PROGRAM
+        self.active_index = self.mode_indices(MODE_PROGRAM)[0]
 
     @property
     def size(self) -> QSize:
@@ -328,36 +353,47 @@ class Page:
         for layer in self.layers:
             layer.image = _resized_canvas(layer.image, w, h, white=False)
 
+    # ---------- 모드(레이어 그룹) ----------
+    def mode_indices(self, mode: str | None = None) -> list[int]:
+        """해당 모드 레이어들의 절대 인덱스(아래→위 순서)."""
+        m = mode or self.current_mode
+        return [i for i, l in enumerate(self.layers) if l.group == m]
+
+    def current_layers(self) -> list[Layer]:
+        return [self.layers[i] for i in self.mode_indices()]
+
+    def set_mode(self, mode: str) -> bool:
+        """현재 모드를 바꾸고 활성 레이어를 그 모드의 맨 위로 옮긴다."""
+        if mode not in MODES or mode == self.current_mode:
+            return False
+        idxs = self.mode_indices(mode)
+        if not idxs:  # 해당 모드 레이어가 없으면 하나 만든다
+            self.layers.append(Layer(DEFAULT_LAYERS[mode][0], self.size, group=mode))
+            idxs = self.mode_indices(mode)
+        self.current_mode = mode
+        self.active_index = idxs[-1]
+        return True
+
     @property
     def active_layer(self) -> Layer:
         return self.layers[self.active_index]
 
     def add_layer(self, name: str | None = None) -> Layer:
-        name = name or f"레이어 {len(self.layers) + 1}"
-        layer = Layer(name, self.size)
-        # 활성 레이어 바로 위에 삽입
-        insert_at = self.active_index + 1
+        count = len(self.mode_indices()) + 1
+        name = name or f"레이어 {count}"
+        layer = Layer(name, self.size, group=self.current_mode)
+        insert_at = self.active_index + 1  # 활성(현재 모드) 바로 위 → 그룹 연속 유지
         self.layers.insert(insert_at, layer)
         self.active_index = insert_at
         return layer
 
     def remove_active_layer(self) -> bool:
-        if len(self.layers) <= 1:
-            return False  # 최소 한 장은 유지
+        if len(self.mode_indices()) <= 1:
+            return False  # 모드마다 최소 한 장은 유지
         del self.layers[self.active_index]
-        self.active_index = min(self.active_index, len(self.layers) - 1)
-        return True
-
-    def move_active(self, delta: int) -> bool:
-        new_index = self.active_index + delta
-        if not (0 <= new_index < len(self.layers)):
-            return False
-        layers = self.layers
-        layers[self.active_index], layers[new_index] = (
-            layers[new_index],
-            layers[self.active_index],
-        )
-        self.active_index = new_index
+        # 같은 모드의 다른 레이어로 활성 이동
+        idxs = self.mode_indices()
+        self.active_index = min(idxs, key=lambda i: abs(i - self.active_index))
         return True
 
 
